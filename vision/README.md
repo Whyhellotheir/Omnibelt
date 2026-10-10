@@ -7,6 +7,9 @@ The whole Orin program: the phone socket, YOLO11n with ByteTrack, Depth Anything
 | `orin/navbelt_server.py` | The server. Put `yolo11n.engine` next to it |
 | `tests/fake_phone.py` | Stand-in phone (webcam or `walk.mp4`) |
 | `tests/yolo_test.py` | Builds the TensorRT engine and checks fps |
+| `tests/find_test.py` | Checks the YOLO-World find-anything detector (`desk.jpg keys wallet`, or `0 keys` for webcam; the live view needs a display) |
 | `tests/depth_test.py` | Checks depth distance and speed |
 
-Settings: `GEMINI_API_KEY`, `GEMINI_MODEL`, `FLIP_IMAGE=1`, `CAM_HEIGHT_M`, `USE_DEPTH=0`, `RING_HAND=left`.
+Settings: `GEMINI_API_KEY`, `GEMINI_MODEL`, `FLIP_IMAGE=1`, `CAM_HEIGHT_M`, `USE_DEPTH=0`, `RING_HAND=left`, `USE_OPEN_VOCAB=0`, `OPEN_VOCAB_CONF` (default 0.15).
+
+"Find my …" asks the local YOLO-World detector first; Gemini is the fallback.

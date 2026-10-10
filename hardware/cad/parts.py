@@ -317,6 +317,7 @@ def all_parts():
         "phone_cradle_iphone17":    (stand_on_x0(phone_cradle("iphone17")[0]), 1, "chest"),
         "phone_cradle_iphone17pro": (stand_on_x0(phone_cradle("iphone17pro")[0]), 1, "chest"),
         "phone_BELT_cradle_iphone17": (stand_on_x0(phone_cradle("iphone17", tilt=8.0, back=4.0, motor_x=37.0)[0]), 1, "belt"),
+        "phone_holder_UNIVERSAL_belt": (holder_print_orientation(universal_phone_holder()[0]), 1, "belt"),
         "ring_cap_TRANSLUCENT": (on_bed(ring_cap()), 1, "ring_optional"),
         "wrist_pod":            (on_bed(wrist_pod()), 1, "ring_optional"),
         "wrist_pod_lid":        (on_bed(wrist_pod_lid()), 1, "ring_optional"),
@@ -354,3 +355,57 @@ if __name__ == "__main__":
         t = to_trimesh(m)
         t.export(f"stl/fit_coupons/{name}.stl")
         print(f"{name:40s} watertight={t.is_watertight}  size={np.round(t.bounds[1]-t.bounds[0],1)}  ~{t.volume/1000*1.24*0.6:.0f} g")
+
+
+# ---------------------------------------------------------------- UNIVERSAL BELT PHONE HOLDER
+# Fits phones about 124-175 mm long, up to ~84 mm wide and ~15 mm thick (case included), landscape.
+# The phone rests on two end pads (near its corners, clear of side buttons), screen against the plate,
+# and one 1" velcro strap across the MIDDLE of its back holds it (cameras sit at an end, so they're clear).
+# Threads onto the 2" belt; M1 motor pocket on the back; tilted down so the camera sees the floor.
+UNI = dict(tilt=8.0, plate_x=48.0, y0=-56.0, y1=61.0, base=3.0, pad_x0=58.0, pad_x1=78.0,
+           pad_top=-34.0, pad_depth=16.0, slot_w=27.0, slot_h=4.0, slot_lo=-50.0, slot_hi=51.0)
+
+def universal_phone_holder():
+    u = UNI
+    px, y0, y1, base = u["plate_x"], u["y0"], u["y1"], u["base"]
+    # --- front part, built flat (backplate in the XY plane, phone side = +Z) ---
+    plate = rounded_box_flat(-px, px, y0, y1, 0, base, 6.0)
+    arms = M()
+    for s in (-1, 1):
+        xa, xb = sorted([s * (px - 4), s * u["pad_x1"]])
+        arms += rounded_box_flat(xa, xb, y0, u["pad_top"] - 2.0, 0, base, 3.0)          # arm in the plate plane
+        pa, pb = sorted([s * u["pad_x0"], s * u["pad_x1"]])
+        pad = M.batch_hull([box(pa, pb, y0, u["pad_top"] - 1.0, 0, base + u["pad_depth"]),
+                            box(pa, pb, y0, u["pad_top"], 0, base + u["pad_depth"] - 1.0)])   # rounded-ish top edge
+        arms += pad
+    front = plate + arms
+    for ylo in (u["slot_lo"], u["slot_hi"]):                                             # strap slots
+        front -= rounded_box_flat(-u["slot_w"] / 2, u["slot_w"] / 2, ylo, ylo + u["slot_h"], -1, base + 1, 1.5)
+
+    # --- mount (sits against the body, axis-aligned when worn) ---
+    back = 4.0
+    mY, mT = TUN_Y + 3.0, back + BELT_T + 2.5
+    mount = body_x(rrect(-mY, mY, 0, mT, 2.5), -px, px, ch=0.6)
+
+    def place(m):                                                        # tilt so the camera looks down
+        m = m.rotate([u["tilt"], 0, 0])
+        lo = box(-px, px, -30, 30, 0, base).rotate([u["tilt"], 0, 0]).bounding_box()[2]
+        return m.translate([0, 0, mT + 1.0 - lo])
+    fr = place(front)
+    strip = place(box(-px + 1, px - 1, -30, 30, 0, 0.5))                 # back face of the plate, middle band
+    sliver = place(box(-px + 1, px - 1, -44.5, -44.0, 0, 0.5))             # 45 deg gusset so it prints upright
+    wedge = M.batch_hull([strip, sliver,
+                          box(-px + 1, px - 1, -mY + 1, mY - 1, mT - 0.5, mT),
+                          box(-px + 1, px - 1, -mY, -mY + 0.5, 0, mT)])
+    part = mount + wedge + fr
+    part -= tunnel(-px, px, back)
+    part -= cyl_z(MOTOR_D, MOTOR_H + 0.02, 0, 0, -0.01)                  # M1 motor pocket (skin side)
+    part -= box(-1.2, 1.2, 0, mY + 1, -0.01, 1.6)
+    part -= box(-1.2, 1.2, mY - 1.5, mY + 1, -0.01, mT)
+    return part, place
+
+
+def holder_print_orientation(m):
+    """Stand it upright on the bottom edge of the plate and pads (backplate vertical): no supports."""
+    m = m.rotate([90.0 - UNI["tilt"], 0, 0])
+    return on_bed(m)

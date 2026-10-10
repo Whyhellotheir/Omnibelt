@@ -10,10 +10,13 @@ Run:
   python3 navbelt_server.py
 Settings (environment variables): FLIP_IMAGE=1 if the dashboard image is upside down,
 CAM_HEIGHT_M=1.0 for the belt cradle (1.3 chest), USE_DEPTH=0 to skip the depth model,
-RING_HAND=left if the ring is on the left hand, YOLO_ENGINE=path, GEMINI_MODEL=name.
+RING_HAND=left if the ring is on the left hand, YOLO_ENGINE=path, GEMINI_MODEL=name,
+USE_OPEN_VOCAB=0 to turn off the find-anything detector, OPEN_VOCAB_CONF=0.25 if it finds wrong things.
 
+Finding objects: the local find-anything detector (YOLO-World) answers first, in a fraction of a
+second; Gemini is only asked when the local detector finds nothing (and for describe + memory).
 Threads: perception (YOLO + depth every frame) -> control (10 Hz motor commands) ;
-         refresher (Gemini re-finds the target) ; memory (Gemini logs objects every few seconds).
+         refresher (re-finds the target) ; memory (logs where objects were seen).
 """
 import asyncio, glob, json, math, os, re, threading, time
 import numpy as np
@@ -32,8 +35,16 @@ CAM_HEIGHT_M = float(os.environ.get("CAM_HEIGHT_M", "1.3"))
 RING_HAND = os.environ.get("RING_HAND", "right")
 OBSTACLE_M = 1.0          # closer than this = blocked
 REACH_M = 0.9             # closer than this = switch from belt to ring
-MEMORY_EVERY_S = 8
-REFRESH_EVERY_S = 1.5
+MEMORY_EVERY_S = 8          # Gemini memory scan (slow, smart)
+LOCAL_MEMORY_EVERY_S = 3    # find-anything memory scan (fast, local)
+REFRESH_LOCAL_S = 0.4       # how often the target is re-found with the local detector
+REFRESH_GEMINI_S = 1.5      # ...and with Gemini when there is no local detector
+# find-anything detector (YOLO-World): give it words, it finds them in every frame, on the Orin
+USE_OPEN_VOCAB = os.environ.get("USE_OPEN_VOCAB", "1") == "1"
+OPEN_VOCAB_MODEL = os.environ.get("OPEN_VOCAB_MODEL", "yolov8s-worldv2.pt")
+OPEN_VOCAB_CONF = float(os.environ.get("OPEN_VOCAB_CONF", "0.15"))
+MEMORY_CLASSES = ["keys", "wallet", "phone", "glasses", "cup", "bottle", "backpack", "bag",
+                  "remote", "laptop", "door", "chair"]
 # body angle of each belt motor in degrees, + = to the wearer's right. Measure on the wearer!
 MOTOR_ANGLES = {1: 0, 2: 45, 3: 90, 4: 120, 5: -120, 6: -90, 7: -45}
 RING = 8
@@ -70,14 +81,16 @@ class State:
         self.last_heard, self.last_said = "", ""
         self.fps = 0.0
         self.depth_source = "none"
+        self.last_finder = ""
 
 
 S = State()
 PHONE = {"ws": None, "loop": None}
-LAST = {"sweep": 0.0, "hint": 0.0, "inside_since": 0.0}
+LAST = {"sweep": 0.0, "hint": 0.0, "inside_since": 0.0, "gemini": 0.0}
 GEMINI_LOCK = threading.Lock()
 BELT = None
 BRAIN = None
+LOCAL = None
 
 
 # ----------------------------------------------------------------- geometry
@@ -226,9 +239,58 @@ def simple_intent(text):
     return {"intent": "", "target": ""}
 
 
+def fast_intent(text):
+    """Instant keyword parse for the common commands; None means 'ask Gemini'."""
+    t = text.lower().strip()
+    it = simple_intent(t)
+    if it["intent"] in ("stop", "walk", "describe"):
+        return it
+    if it["intent"] in ("find", "goto") and it["target"]:
+        return it
+    if it["intent"] == "follow" and re.search(r"follow (me|them|him|her|us)\b", t):
+        return it
+    return None
+
+
+class LocalFinder:
+    """YOLO-World: open-vocabulary detector. set the words, it finds them; runs on the Orin's GPU."""
+    def __init__(self):
+        self.model, self.classes, self.lock = None, None, threading.Lock()
+        if not USE_OPEN_VOCAB:
+            print("Find-anything detector off (USE_OPEN_VOCAB=0)")
+            return
+        try:
+            from ultralytics import YOLOWorld
+            self.model = YOLOWorld(OPEN_VOCAB_MODEL)
+            self._set(["keys"])                        # first run downloads the text encoder (needs internet)
+            self.model.predict(np.zeros((H, W, 3), np.uint8), verbose=False)
+            print("Find-anything detector ready:", OPEN_VOCAB_MODEL)
+        except Exception as e:
+            print("Find-anything detector off:", e)
+            self.model = None
+
+    def _set(self, names):
+        if names != self.classes:
+            self.model.set_classes(list(names))
+            self.classes = list(names)
+
+    def detect(self, frame, names, conf=None):
+        if self.model is None or frame is None or not names:
+            return []
+        with self.lock:
+            self._set(names)
+            r = self.model.predict(frame, conf=OPEN_VOCAB_CONF if conf is None else conf, verbose=False)[0]
+        out = []
+        if r.boxes is not None and len(r.boxes):
+            for b, c, cf in zip(r.boxes.xyxy.tolist(), r.boxes.cls.int().tolist(), r.boxes.conf.tolist()):
+                out.append({"label": names[c] if c < len(names) else names[0], "box": b, "conf": cf})
+        return sorted(out, key=lambda d: -d["conf"])
+
+
 class Brain:
     def __init__(self):
         self.client, self.types = None, None
+        self.no_think = True
         key = os.environ.get("GEMINI_API_KEY")
         if key:
             from google import genai
@@ -236,13 +298,27 @@ class Brain:
             self.client, self.types = genai.Client(api_key=key), types
             print("Gemini ready:", GEMINI_MODEL)
         else:
-            print("GEMINI_API_KEY not set - keyword commands only, no find/describe/memory")
+            print("GEMINI_API_KEY not set - finding uses the local detector only; no describe")
 
     def _ask(self, parts, as_json=True):
-        cfg = self.types.GenerateContentConfig(
-            response_mime_type="application/json" if as_json else "text/plain", temperature=0.2)
-        with GEMINI_LOCK:
-            r = self.client.models.generate_content(model=GEMINI_MODEL, contents=parts, config=cfg)
+        kw = dict(response_mime_type="application/json" if as_json else "text/plain", temperature=0.2)
+        if self.no_think:                                # skip Gemini's 'thinking' step: much faster
+            try:
+                kw["thinking_config"] = self.types.ThinkingConfig(thinking_budget=0)
+            except Exception:
+                self.no_think = False
+        t0 = time.time()
+        try:
+            with GEMINI_LOCK:
+                r = self.client.models.generate_content(model=GEMINI_MODEL, contents=parts,
+                                                        config=self.types.GenerateContentConfig(**kw))
+        except Exception as e:
+            if self.no_think and "think" in str(e).lower():
+                self.no_think = False                    # this model can't turn thinking off; retry normally
+                return self._ask(parts, as_json)
+            raise
+        LAST["gemini"] = time.time()
+        print(f"Gemini answered in {time.time() - t0:.1f} s")
         return json.loads(r.text) if as_json else r.text.strip()
 
     def _img(self, frame):
@@ -250,6 +326,9 @@ class Brain:
         return self.types.Part.from_bytes(data=jpg, mime_type="image/jpeg")
 
     def intent(self, text):
+        fast = fast_intent(text)
+        if fast is not None:
+            return fast
         if not self.client:
             return simple_intent(text)
         try:
@@ -277,8 +356,20 @@ class Brain:
                 continue
         return out
 
-    def find(self, frame, target):
-        return self._boxes(frame, FIND_PROMPT.format(target=target))
+    def find(self, frame, target, gemini_ok=True):
+        """local find-anything detector first; Gemini only if it finds nothing."""
+        items = LOCAL.detect(frame, [target]) if LOCAL is not None else []
+        if items:
+            with S.lock:
+                S.last_finder = f"YOLO-World ({items[0]['conf']:.2f})"
+            return items
+        if not gemini_ok:
+            return []
+        items = self._boxes(frame, FIND_PROMPT.format(target=target))
+        if items:
+            with S.lock:
+                S.last_finder = "Gemini"
+        return items
 
     def scan(self, frame):
         return self._boxes(frame, SCAN_PROMPT)
@@ -440,8 +531,9 @@ def start_find(target, walk_only=False):
             start_reach(tgt)
             return
         set_mode("GOTO", tgt)
-        say(f"Your {target} is {direction_words(rel)}, about {max(1, round(tgt['dist']))} meters away. Follow the belt."
-            if not walk_only else f"The {target} is {direction_words(rel)}. Follow the belt.")
+        verb = "are" if target.endswith("s") else "is"
+        say(f"Your {target} {verb} {direction_words(rel)}, about {max(1, round(tgt['dist']))} meters away. Follow the belt."
+            if not walk_only else f"The {target} {verb} {direction_words(rel)}. Follow the belt.")
         return
     mem = recall(target)
     if mem:
@@ -624,8 +716,9 @@ def control_loop():
 def refresher_loop():
     """re-finds the current target so the box/position stay fresh (GOTO, SEARCH, REACH)."""
     while True:
-        time.sleep(REFRESH_EVERY_S)
-        if BRAIN is None or BRAIN.client is None:
+        local_ok = LOCAL is not None and LOCAL.model is not None
+        time.sleep(REFRESH_LOCAL_S if local_ok else REFRESH_GEMINI_S)
+        if BRAIN is None or (BRAIN.client is None and not local_ok):
             continue
         with S.lock:
             mode, tgt = S.mode, S.target
@@ -638,7 +731,7 @@ def refresher_loop():
             heading, _, pos = pose(meta)
             if abs(wrap(heading_to(pos, tgt["pos"])[0] - heading)) > abs(px_bearing(0, meta)):
                 continue                                           # target not in view: nothing to refresh
-        items = BRAIN.find(frame, tgt["label"])
+        items = BRAIN.find(frame, tgt["label"], gemini_ok=time.time() - LAST["gemini"] > REFRESH_GEMINI_S)
         if not items:
             if mode == "SEARCH" and time.time() - tgt.get("started", time.time()) > 25:
                 say(f"I still can't find your {tgt['label']}. Stopping the search.")
@@ -663,10 +756,12 @@ def refresher_loop():
 
 
 def memory_loop():
-    """every few seconds, logs where notable objects are, so 'where did I leave...' works later."""
+    """logs where notable objects are, so 'where did I leave...' works later.
+    Local find-anything scan every few seconds; Gemini adds a smarter scan now and then."""
+    last_gemini = 0.0
     while True:
-        time.sleep(MEMORY_EVERY_S)
-        if BRAIN is None or BRAIN.client is None:
+        time.sleep(LOCAL_MEMORY_EVERY_S)
+        if BRAIN is None:
             continue
         with S.lock:
             mode = S.mode
@@ -675,7 +770,13 @@ def memory_loop():
         frame, meta, depth = latest()
         if frame is None:
             continue
-        for it in BRAIN.scan(frame):
+        items = []
+        if LOCAL is not None and LOCAL.model is not None:
+            items += LOCAL.detect(frame, MEMORY_CLASSES, conf=0.25)
+        if BRAIN.client is not None and time.time() - last_gemini > MEMORY_EVERY_S:
+            last_gemini = time.time()
+            items += BRAIN.scan(frame)
+        for it in items:
             if not it["label"]:
                 continue
             t = lock_target(it["label"], it["box"], meta, depth)
@@ -763,7 +864,7 @@ async def state():
         tgt = S.target or {}
         return JSONResponse({
             "mode": S.mode, "fps": round(S.fps, 1), "motors": {str(k): v for k, v in S.motors.items()},
-            "heard": S.last_heard, "said": S.last_said, "target": tgt.get("label"),
+            "heard": S.last_heard, "said": S.last_said, "target": tgt.get("label"), "finder": S.last_finder,
             "depth": S.depth_source, "phone": PHONE["ws"] is not None,
             "memory": sorted([[k, int(time.time() - v["t"])] for k, v in S.memory.items()], key=lambda kv: kv[1])[:8]})
 
@@ -817,7 +918,7 @@ const r=m['8'];s+=`<circle r="${r?24:16}" fill="${r?'#ff9f0a':'#333'}"/><text y=
 document.getElementById('belt').innerHTML=s;}
 async function tick(){try{const s=await (await fetch('/state')).json();belt(s.motors);
 document.getElementById('phone').textContent=s.phone?'phone connected':'phone NOT connected';
-document.getElementById('status').innerHTML=`Mode: <b>${s.mode}</b>${s.target?' ('+s.target+')':''}<br>Heard: ${s.heard||'-'}<br>Said: ${s.said||'-'}<br>${s.fps} fps, depth: ${s.depth}`;
+document.getElementById('status').innerHTML=`Mode: <b>${s.mode}</b>${s.target?' ('+s.target+')':''}<br>Heard: ${s.heard||'-'}<br>Said: ${s.said||'-'}<br>Found by: ${s.finder||'-'}<br>${s.fps} fps, depth: ${s.depth}`;
 document.getElementById('memory').innerHTML=s.memory.length?'<b>Last seen</b><br>'+s.memory.map(m=>`${m[0]} - ${m[1]} s ago`).join('<br>'):'';}catch(e){}}
 setInterval(tick,200);belt({});
 </script></body></html>"""
@@ -825,6 +926,7 @@ setInterval(tick,200);belt({});
 
 if __name__ == "__main__":
     BELT = Belt()
+    LOCAL = LocalFinder()
     BRAIN = Brain()
     for fn in (perception_loop, control_loop, refresher_loop, memory_loop):
         threading.Thread(target=fn, daemon=True).start()

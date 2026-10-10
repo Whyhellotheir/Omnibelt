@@ -25,6 +25,12 @@ iPhone 17 (eyes/ears) --WebSocket :8765/stream--> Jetson Orin Nano Super (reflex
   - YOLO11n (TensorRT) with ByteTrack
   - Depth Anything V2 Small, metric indoor (every 1–2 frames; there is no LiDAR)
   - Apple Vision hand pose and ARKit world tracking, both on the phone
+- **Finding runs on the Nano first** (Build Guide v2, 2026-10-10):
+  - **YOLO-World** (`yolov8s-worldv2.pt`) is an open-vocabulary detector. Give it words and it finds them, on the Orin GPU.
+  - It answers "find my …" first, re-finds the target every 0.4 s (`REFRESH_LOCAL_S`), and scans `MEMORY_CLASSES` every 3 s to feed memory.
+  - **Gemini is now the backup.** It is called only when the local detector finds nothing (at most every 1.5 s), plus for describe and a smarter memory scan every 8 s. Thinking is turned off for speed.
+  - Common commands (stop/walk/describe/"find my X"/"take me to X"/"follow me") are parsed instantly by keywords in `fast_intent`. Anything else goes to Gemini.
+  - The dashboard shows "Found by: YOLO-World (conf)" or "Gemini".
 - Steering:
   - Take the depth band from knee to head height and split it into 16 sectors. A sector is blocked if anything in it is under 1.0 m (`OBSTACLE_M`).
   - Pick the open sector closest to the goal and buzz the nearest motor, blending two motors for in-between angles.
@@ -35,10 +41,22 @@ iPhone 17 (eyes/ears) --WebSocket :8765/stream--> Jetson Orin Nano Super (reflex
 |---|---|---|---|
 | `hardware/` | A · Hardware (**Hieu**): wiring, firmware, prints, belt, ring | `firmware/navbelt_fw/navbelt_fw.ino`, `cad/parts.py`, `tests/belt_test.py` | `esp32/…`, `cad/…`, `tests/belt_test.py` |
 | `software/` | B · iOS app: ARKit stream, hands, speech, ElevenLabs | `ios/NavBelt/*.swift`, `ios/NavBelt/Info-plist-keys.txt`, `tests/test_receiver.py` | `ios/…`, `tests/test_receiver.py` |
-| `vision/` | C · Orin: YOLO, depth, steering, motors, dashboard | `orin/navbelt_server.py`, `tests/fake_phone.py`, `tests/yolo_test.py`, `tests/depth_test.py` | `orin/…`, `tests/…` |
+| `vision/` | C · Orin: YOLO, depth, steering, motors, dashboard | `orin/navbelt_server.py`, `tests/fake_phone.py`, `tests/yolo_test.py`, `tests/find_test.py` (YOLO-World), `tests/depth_test.py` | `orin/…`, `tests/…` |
 | `ai/` | D · AI + pitch: Gemini prompts, intent, memory, spoken lines, slides | `tests/gemini_find_test.py`, `tests/elevenlabs_test.py` | `tests/…` |
 
 - The build guide assumes the original flat zip layout. Use the right-hand column to translate its paths.
+- **Orin server settings** (env vars):
+  - `GEMINI_API_KEY`, `GEMINI_MODEL`
+  - `FLIP_IMAGE=1`
+  - `CAM_HEIGHT_M` (1.0 belt / 1.3 chest)
+  - `USE_DEPTH=0` (also the fix for out-of-memory)
+  - `RING_HAND=left`
+  - `USE_OPEN_VOCAB=0` turns YOLO-World off. `OPEN_VOCAB_CONF` (code default 0.15) can be raised (e.g. 0.25) if it finds wrong things or the reach box jumps.
+- **Orin setup additions in v2:**
+  - `sudo apt install git tmux` and `pip install git+https://github.com/ultralytics/CLIP.git`
+  - `python3 -c "import torch; print(torch.cuda.is_available())"` must print True. If it's False, every model runs on the CPU.
+  - Run `yolo_test.py`, `find_test.py` and `depth_test.py` once on good Wi-Fi so the models are cached.
+  - Use MAXN SUPER mode on wall power and 15W on battery.
 - AI's prompts (`INTENT_PROMPT`, `SCAN_PROMPT`), its `say(...)` lines, and `DASHBOARD_HTML` all live inside `vision/orin/navbelt_server.py`. Coordinate with Vision before editing them.
 
 ## Interfaces (shared contract: change only with whole-team agreement)
@@ -70,7 +88,7 @@ iPhone 17 (eyes/ears) --WebSocket :8765/stream--> Jetson Orin Nano Super (reflex
 Firmware safety limits:
 - At most 3 motors on at once.
 - Everything auto-stops if no command arrives for 500 ms. The server re-sends 10–15 times a second.
-- Opening the serial port resets the ESP32, so wait 2 s before sending anything.
+- Opening the serial port normally resets the ESP32, so wait 2 s before sending anything. The server does this. `belt_test.py` opens the port with DTR/RTS held low so the board doesn't reset; press **EN** when it asks you to.
 
 **Dashboard:** `http://orin.local:8765/`, served by the Orin. The design doc also describes port 8080 with `/video/camera`, `/video/depth` and `/state`. The current code serves everything on 8765.
 
@@ -107,7 +125,7 @@ Firmware safety limits:
   1. In Arduino IDE 2, install "esp32 by Espressif" and pick the board **ESP32 Dev Module**. Upload. If it hangs at "Connecting…", hold BOOT.
   2. Open the Serial Monitor at 115200 with line ending "Newline". Run `PING`, then `WD 0`, then `M 1 80 S`, then `M 1 0 S`, then `TEST`.
   3. Add motors one at a time, running `TEST` after each one.
-  4. Close the Serial Monitor and run `python hardware/tests/belt_test.py` (needs `pip install pyserial`).
+  4. Close the Serial Monitor (only one program can hold the port), then run `python hardware/tests/belt_test.py COM9` on Windows with the CP210x COM port from Device Manager. On Mac/Linux, leave out the port and it's found automatically. Needs `pip install pyserial`. Press EN on the ESP32 when prompted.
 - **Done when:** `TEST` buzzes M1–M8 in order and `belt_test.py` runs clean.
 - **Rules:**
   - Never solder or glue a motor until it has passed `TEST`.
@@ -130,10 +148,11 @@ After checkpoint 3: freeze, rehearse the 90 s demo five times, and record a back
 - Pull before you push. Small commits, staged by file name.
 
 ## Open issues
-- **DUTY_CAP:** `hardware/firmware/navbelt_fw/navbelt_fw.ino:30` is `0.65` (matches the docs; 3V motors on ~4V). Hieu's local navbelt_code had `1.0`; if pulses are too weak, raise it here deliberately.
+- **DUTY_CAP (resolved):** `hardware/firmware/navbelt_fw/navbelt_fw.ino:30` is `0.65`, the same as the latest `navbelt_code (1).zip` and the docs. If the pulses are too weak, raise it here on purpose.
 - Does the team have a Mac? Without one, the phone side becomes a browser page served by the Orin.
 - Sponsor LiDAR? Battery 15V label? Demo wearer's ring size?
 
 ## Worklog
 - 2026-10-10: Repo seeded from `navbelt_code.zip` and split into hardware/software/vision/ai. CLAUDE.md written from the design doc and build guide.
 - 2026-10-10: Merged Jayce's flat initial commit; files moved into track folders, firmware kept at DUTY_CAP 0.65.
+- 2026-10-10: Build Guide v2: YOLO-World find-anything runs locally on the Nano with Gemini as the fallback (server + `vision/tests/find_test.py`). Took the newer `belt_test.py` (Windows COM port, no reset on open) and `parts.py` (universal belt phone holder) from `navbelt_code (1).zip`.
