@@ -1,0 +1,27 @@
+# secrets
+.env
+.env.*
+*.key
+
+# model artifacts (built on the Orin)
+*.engine
+*.onnx
+*.pt
+
+# test media / outputs
+*.mp4
+latest.jpg
+found.jpg
+
+# python / os / editors
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+xcuserdata/
+
+# cad output
+*.stl
