@@ -35,6 +35,14 @@ iPhone 17 (eyes/ears) --WebSocket :8765/stream--> Jetson Orin Nano Super (reflex
   - Take the depth band from knee to head height and split it into 16 sectors. A sector is blocked if anything in it is under 1.0 m (`OBSTACLE_M`).
   - Pick the open sector closest to the goal and buzz the nearest motor, blending two motors for in-between angles.
   - Pulse faster as things get closer. If every sector is blocked, play `SWEEP`; when the goal is reached, play `ARRIVE`.
+  - Obstacles are depth points between ankle and head height (`OBST_MIN_H` 0.15 m to `OBST_MAX_H` 1.9 m), computed with exact pinhole geometry from `CAM_HEIGHT_M` and the ARKit pitch. The floor never counts as a wall.
+- **Path planning** (navbelt_code (2), 2026-10-10):
+  - Depth plus the ARKit pose build a 12×12 m floor map with 15 cm cells, centred on the start point. Things are forgotten after about 15–30 s.
+  - A* plans a route to the goal around everything seen, including obstacles no longer in view, keeping 0.35 m clear (`BODY_RADIUS_M`). It re-plans every 0.4 s, in GOTO mode only.
+  - Steering follows the route by aiming at a point 0.8 m ahead, and the dodge layer still checks every frame.
+  - No route (start or goal off the map, ARKit not tracking, goal unreachable) falls back to steering straight at the goal, with dodging.
+  - `USE_PLANNER=0` turns it off, leaving dodging only.
+  - The dashboard has a **Map** view (black = obstacle, orange = route, red = goal, green = you) and shows Path: route / dodge only / off. The map stays blank with `fake_phone.py`, because it sends `tracking:false`.
 
 ## Repo layout (one folder per track)
 | Folder | Track / owner | Contents | Build-guide path |
@@ -51,6 +59,8 @@ iPhone 17 (eyes/ears) --WebSocket :8765/stream--> Jetson Orin Nano Super (reflex
   - `CAM_HEIGHT_M` (1.0 belt / 1.3 chest)
   - `USE_DEPTH=0` (also the fix for out-of-memory)
   - `RING_HAND=left`
+  - `USE_PLANNER=0`: dodging only, no map or route.
+  - **Measure `CAM_HEIGHT_M` on the wearer to within about 10 cm.** If the Map shows phantom obstacles on open floor, the camera height is set too high or depth reads short. Raise `OBST_MIN_H` from 0.15 to 0.2 in `navbelt_server.py`.
   - `USE_OPEN_VOCAB=0` turns YOLO-World off. `OPEN_VOCAB_CONF` (code default 0.15) can be raised (e.g. 0.25) if it finds wrong things or the reach box jumps.
 - **Orin setup additions in v2:**
   - `sudo apt install git tmux` and `pip install git+https://github.com/ultralytics/CLIP.git`
@@ -60,13 +70,13 @@ iPhone 17 (eyes/ears) --WebSocket :8765/stream--> Jetson Orin Nano Super (reflex
 - AI's prompts (`INTENT_PROMPT`, `SCAN_PROMPT`), its `say(...)` lines, and `DASHBOARD_HTML` all live inside `vision/orin/navbelt_server.py`. Coordinate with Vision before editing them.
 
 ## Interfaces (shared contract: change only with whole-team agreement)
-**Phone → Orin** (`ws://orin.local:8765/stream`). Each frame is sent as three messages:
+**Phone → Orin** (`ws://orin.local:8765/stream`). Each frame is sent as three messages. `tracking` was added 2026-10-10: true when ARKit tracking is normal, and the map only updates then. If it's missing, it's treated as true.
 1. A JSON text message.
 2. The 640×480 JPEG, as a binary message.
 3. A float16 depth array, only if `depth` is true.
 
 ```json
-{"type":"frame","seq":123,"t":1760000000.12,"yaw":1.57,"pitch":-0.21,"T":[16 floats, ARKit camera-to-world, column-major],"intr":["fx","fy","cx","cy"],"hands":[{"side":"right","wrist":[x,y],"index":[x,y],"conf":0.9}],"depth":false}
+{"type":"frame","seq":123,"t":1760000000.12,"yaw":1.57,"pitch":-0.21,"T":[16 floats, ARKit camera-to-world, column-major],"intr":["fx","fy","cx","cy"],"hands":[{"side":"right","wrist":[x,y],"index":[x,y],"conf":0.9}],"depth":false,"tracking":true}
 {"type":"cmd","text":"find my keys"}
 ```
 
@@ -133,7 +143,8 @@ Firmware safety limits:
 - **Next stages:**
   - Stage 2: solder 40 cm leads, fit the pods, set `MOTOR_ANGLES` in the server.
   - Stage 4: the ring on M8, plus an optional LED with a 150 Ω resistor on ULN pin 11.
-  - 3D prints are in `PRINT_THIS.zip` (15 parts, ~300 g PLA/PETG, no supports). Print one motor pod first as a fit test.
+  - 3D prints are in `PRINT_THIS.zip` (15 parts, ~300 g PLA/PETG, no supports). Print one motor pod first as a fit test. To regenerate them: `cd hardware/cad && python parts.py` (needs `pip install manifold3d trimesh numpy`), which writes `stl/`.
+  - Swap ring: `stl/ring_optional/ring_SWAP_plate.stl` holds all six sizes plus 3 motor capsules on one bed. The capsule slides into any ring from the fingertip side, and the wire's pull holds it in.
 
 ## Checkpoints
 1. Wave a hand at the phone and the right motor buzzes.
@@ -156,3 +167,4 @@ After checkpoint 3: freeze, rehearse the 90 s demo five times, and record a back
 - 2026-10-10: Repo seeded from `navbelt_code.zip` and split into hardware/software/vision/ai. CLAUDE.md written from the design doc and build guide.
 - 2026-10-10: Merged Jayce's flat initial commit; files moved into track folders, firmware kept at DUTY_CAP 0.65.
 - 2026-10-10: Build Guide v2: YOLO-World find-anything runs locally on the Nano with Gemini as the fallback (server + `vision/tests/find_test.py`). Took the newer `belt_test.py` (Windows COM port, no reset on open) and `parts.py` (universal belt phone holder) from `navbelt_code (1).zip`.
+- 2026-10-10: navbelt_code (2): floor map + A* path planning on the Orin, `tracking` flag from the phone, swap ring CAD. Fixed `parts.py` crashing at export (an ordering bug since the universal holder; all 24 STLs now export watertight). Fixed the obstacle height/distance math (the chest mount missed a 0.35 m backpack; synthetic checks in commit 3fcbcae).
