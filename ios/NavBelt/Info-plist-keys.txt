@@ -1,0 +1,11 @@
+Add these in Xcode: target -> Info tab -> Custom iOS Target Properties (or Info.plist):
+
+Privacy - Camera Usage Description              = Streams what the camera sees to the belt.
+Privacy - Microphone Usage Description          = Listens for "Belt, ..." commands.
+Privacy - Speech Recognition Usage Description  = Turns your voice commands into text.
+Privacy - Local Network Usage Description       = Talks to the Jetson Orin on the belt.
+App Transport Security Settings (Dictionary)
+    Allow Local Networking (Boolean)            = YES     <- needed for ws:// to orin.local / 172.20.10.x
+
+Also: Signing & Capabilities -> Team = your Apple ID; set Deployment target iOS 17;
+in General -> Device Orientation, tick only Landscape Right (keeps the app layout steady in the cradle).
