@@ -12,6 +12,13 @@
   - ElevenLabs voice
   - The ring is the differentiator and the centerpiece of the demo.
 
+## Phone mount (decided 2026-10-10): belt, front, at the navel
+- Print `phone_BELT_cradle_iphone17`: tilted 8° down, with the M1 pocket in its back. It replaces `motor_pod_FRONT`. For any other phone, print `phone_holder_UNIVERSAL_belt` instead. Skip the chest cradle and chest strap.
+- Landscape. Keep the Camera Control button free, because a squeeze opens the Camera app and kills ours.
+- The server default is now `CAM_HEIGHT_M=1.0`. Measure the real lens height on the wearer and set it if it's more than about 10 cm off.
+- Trade-off: head-height obstacles are only visible from about 2–3 m away and drop out of view as the wearer gets close. The path planner's map still remembers them.
+- **Risk to test:** M1 vibrates right behind the phone. That can blur frames and upset ARKit's motion tracking. Watch the dashboard fps and the Map view while M1 buzzes. If tracking drifts, add a foam pad between motor and cradle, or move M1 into a pod beside the cradle.
+
 ## Architecture
 ```
 iPhone 17 (eyes/ears) --WebSocket :8765/stream--> Jetson Orin Nano Super (reflexes) --USB serial 115200--> ESP32 + ULN2803 (muscles) --> 7 belt motors + ring (M8)
@@ -56,7 +63,7 @@ iPhone 17 (eyes/ears) --WebSocket :8765/stream--> Jetson Orin Nano Super (reflex
 - **Orin server settings** (env vars):
   - `GEMINI_API_KEY`, `GEMINI_MODEL`
   - `FLIP_IMAGE=1`
-  - `CAM_HEIGHT_M` (1.0 belt / 1.3 chest)
+  - `CAM_HEIGHT_M` (default 1.0 for the belt mount; 1.3 for chest)
   - `USE_DEPTH=0` (also the fix for out-of-memory)
   - `RING_HAND=left`
   - `USE_PLANNER=0`: dodging only, no map or route.
@@ -168,3 +175,4 @@ After checkpoint 3: freeze, rehearse the 90 s demo five times, and record a back
 - 2026-10-10: Merged Jayce's flat initial commit; files moved into track folders, firmware kept at DUTY_CAP 0.65.
 - 2026-10-10: Build Guide v2: YOLO-World find-anything runs locally on the Nano with Gemini as the fallback (server + `vision/tests/find_test.py`). Took the newer `belt_test.py` (Windows COM port, no reset on open) and `parts.py` (universal belt phone holder) from `navbelt_code (1).zip`.
 - 2026-10-10: navbelt_code (2): floor map + A* path planning on the Orin, `tracking` flag from the phone, swap ring CAD. Fixed `parts.py` crashing at export (an ordering bug since the universal holder; all 24 STLs now export watertight). Fixed the obstacle height/distance math (the chest mount missed a 0.35 m backpack; synthetic checks in commit 3fcbcae).
+- 2026-10-10: Phone moves to the belt (front, navel). `CAM_HEIGHT_M` default changed 1.3 → 1.0; print the belt cradle, not the chest one.

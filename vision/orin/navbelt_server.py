@@ -9,7 +9,7 @@ Run:
   export GEMINI_API_KEY=...            # optional: without it, simple keyword commands still work
   python3 navbelt_server.py
 Settings (environment variables): FLIP_IMAGE=1 if the dashboard image is upside down,
-CAM_HEIGHT_M=1.0 for the belt cradle (1.3 chest), USE_DEPTH=0 to skip the depth model,
+CAM_HEIGHT_M=1.0 belt cradle (default; set 1.3 for the chest), USE_DEPTH=0 to skip the depth model,
 RING_HAND=left if the ring is on the left hand, YOLO_ENGINE=path, GEMINI_MODEL=name, USE_PLANNER=0 to
 use dodging only (no map / route planning),
 USE_OPEN_VOCAB=0 to turn off the find-anything detector, OPEN_VOCAB_CONF=0.25 if it finds wrong things.
@@ -34,7 +34,7 @@ USE_DEPTH = os.environ.get("USE_DEPTH", "1") == "1"
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
 FLIP_IMAGE = os.environ.get("FLIP_IMAGE", "0") == "1"
-CAM_HEIGHT_M = float(os.environ.get("CAM_HEIGHT_M", "1.3"))
+CAM_HEIGHT_M = float(os.environ.get("CAM_HEIGHT_M", "1.0"))   # phone on the belt at the navel (chest cradle: 1.3)
 RING_HAND = os.environ.get("RING_HAND", "right")
 OBSTACLE_M = 1.0          # closer than this = blocked
 REACH_M = 0.9             # closer than this = switch from belt to ring
