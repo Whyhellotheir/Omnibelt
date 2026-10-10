@@ -327,15 +327,6 @@ def all_parts():
     return P
 
 
-if __name__ == "__main__":
-    for name, (m, qty, folder) in all_parts().items():
-        os.makedirs(f"stl/{folder}", exist_ok=True)
-        t = to_trimesh(m)
-        t.export(f"stl/{folder}/{name}.stl")
-        ext = t.bounds[1] - t.bounds[0]
-        print(f"{name:28s} x{qty}  watertight={t.is_watertight}  size={np.round(ext,1)}")
-
-
 # ---------------------------------------------------------------- FIT COUPONS
 def coupons():
     """Short slices of the big prints (bed end only) to check fit in minutes before committing hours."""
@@ -347,14 +338,6 @@ def coupons():
         "COUPON_orin_tray_slice":                slice_(stand_on_x0(orin_tray()), 10.0),
         "COUPON_belt_hub_slice":                 slice_(stand_on_x0(belt_hub()), 14.0),
     }
-
-
-if __name__ == "__main__":
-    os.makedirs("stl/fit_coupons", exist_ok=True)
-    for name, m in coupons().items():
-        t = to_trimesh(m)
-        t.export(f"stl/fit_coupons/{name}.stl")
-        print(f"{name:40s} watertight={t.is_watertight}  size={np.round(t.bounds[1]-t.bounds[0],1)}  ~{t.volume/1000*1.24*0.6:.0f} g")
 
 
 # ---------------------------------------------------------------- UNIVERSAL BELT PHONE HOLDER
@@ -473,3 +456,24 @@ def swap_ring_plate(n_capsules=3):
         c = capsule_print()
         out += c.translate([-8.0 + k * 24.0, 70.0, 0])
     return on_bed(out)
+
+
+# ---------------------------------------------------------------- EXPORT (runs last, so every part above is defined)
+if __name__ == "__main__":
+    for name, (m, qty, folder) in all_parts().items():
+        os.makedirs(f"stl/{folder}", exist_ok=True)
+        t = to_trimesh(m)
+        t.export(f"stl/{folder}/{name}.stl")
+        ext = t.bounds[1] - t.bounds[0]
+        print(f"{name:28s} x{qty}  watertight={t.is_watertight}  size={np.round(ext,1)}")
+
+    os.makedirs("stl/ring_optional", exist_ok=True)              # swap ring system: all sizes + 3 capsules, one bed
+    t = to_trimesh(swap_ring_plate())
+    t.export("stl/ring_optional/ring_SWAP_plate.stl")
+    print(f"{'ring_SWAP_plate':28s} x1  watertight={t.is_watertight}  size={np.round(t.bounds[1]-t.bounds[0],1)}")
+
+    os.makedirs("stl/fit_coupons", exist_ok=True)
+    for name, m in coupons().items():
+        t = to_trimesh(m)
+        t.export(f"stl/fit_coupons/{name}.stl")
+        print(f"{name:40s} watertight={t.is_watertight}  size={np.round(t.bounds[1]-t.bounds[0],1)}  ~{t.volume/1000*1.24*0.6:.0f} g")
