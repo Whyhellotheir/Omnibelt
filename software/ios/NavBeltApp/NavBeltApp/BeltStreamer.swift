@@ -95,6 +95,25 @@ final class BeltStreamer: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
+    private func actionPrompt(for text: String) -> String {
+        let normalized = text.lowercased()
+        if normalized.hasPrefix("walk") || normalized.hasPrefix("reach") {
+            return text
+        }
+
+        let reachPhrases = ["reach out", "right in front of you", "within reach", "move your hand", "grab", "pick up"]
+        if reachPhrases.contains(where: normalized.contains) {
+            return "Reach. \(text)"
+        }
+
+        let walkPhrases = ["turn left", "turn right", "go left", "go right", "forward", "backward", "straight ahead", "keep walking", "continue walking", "step left", "step right"]
+        if walkPhrases.contains(where: normalized.contains) {
+            return "Walk. \(text)"
+        }
+
+        return text
+    }
+
     // MARK: - WebSocket
     private func connect() {
         guard let url = URL(string: "ws://\(host):\(Config.port)/stream") else { return }
@@ -119,7 +138,8 @@ final class BeltStreamer: NSObject, ObservableObject, ARSessionDelegate {
                    let type = obj["type"] as? String {
                     if type == "say", let say = obj["text"] as? String {
                         self.updateCameraMode(forSpokenText: say)
-                        DispatchQueue.main.async { self.voice?.say(say) }
+                        let promptedText = self.actionPrompt(for: say)
+                        DispatchQueue.main.async { self.voice?.say(promptedText) }
                     } else if type == "camera_mode", let mode = obj["mode"] as? String {
                         self.setCameraMode(mode == "search" ? .localSearch : .navigation)
                     }
