@@ -3,7 +3,7 @@ import Speech
 import AVFoundation
 import Combine
 
-/// Voice in: always-on speech recognition; anything said after the wake word ("belt") is sent as a command.
+/// Voice in: always-on speech recognition; anything said after the wake word ("Omnibelt") is sent as a command.
 /// Voice out: ElevenLabs (cached phrases play instantly), falling back to Apple's built-in voice.
 final class VoiceIO: NSObject, ObservableObject {
     @Published var lastHeard = ""
@@ -17,14 +17,16 @@ final class VoiceIO: NSObject, ObservableObject {
     private var restartTimer: Timer?
     private var recognitionSession = 0
     private var active = false
+    private var host = Config.defaultHost
     private weak var streamer: BeltStreamer?
 
     private var player: AVAudioPlayer?
     private let synth = AVSpeechSynthesizer()
     private var cache: [String: Data] = [:]
 
-    func start(streamer: BeltStreamer) {
+    func start(streamer: BeltStreamer, host: String) {
         self.streamer = streamer
+        self.host = host
         active = true
         let audio = AVAudioSession.sharedInstance()
         try? audio.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth, .duckOthers])
@@ -107,8 +109,14 @@ final class VoiceIO: NSObject, ObservableObject {
     }
 
     private func finish(_ text: String) {
-        if let range = text.range(of: Config.wakeWord, options: .backwards) {
-            let command = text[range.upperBound...]
+        let trimmed = text.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+        let wakePhrases = [Config.wakeWord, "omni belt", "omni-belt"]
+        let wakeRange = wakePhrases.compactMap {
+            trimmed.range(of: $0, options: .backwards)
+        }.max { $0.lowerBound < $1.lowerBound }
+
+        if let wakeRange {
+            let command = trimmed[wakeRange.upperBound...]
                 .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
             if !command.isEmpty {
                 streamer?.sendCommand(command)
@@ -135,15 +143,15 @@ final class VoiceIO: NSObject, ObservableObject {
     }
 
     private func fetch(_ text: String, completion: @escaping (Data?) -> Void) {
-        guard !Config.elevenLabsKey.hasPrefix("PASTE"), !Config.elevenLabsKey.isEmpty,
-              let url = URL(string: "https://api.elevenlabs.io/v1/text-to-speech/\(Config.elevenLabsVoiceID)?output_format=mp3_44100_128")
-        else { completion(nil); return }
+        guard let url = URL(string: "http://\(host):\(Config.port)/tts") else {
+            completion(nil)
+            return
+        }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
-        req.setValue(Config.elevenLabsKey, forHTTPHeaderField: "xi-api-key")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("audio/mpeg", forHTTPHeaderField: "Accept")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: ["text": text, "model_id": "eleven_flash_v2_5"])
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["text": text])
         URLSession.shared.dataTask(with: req) { data, response, _ in
             let ok = (response as? HTTPURLResponse)?.statusCode == 200
             completion(ok ? data : nil)

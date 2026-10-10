@@ -12,6 +12,8 @@ The whole Orin program: the phone socket, YOLO11n with ByteTrack, Depth Anything
 
 Settings: `GEMINI_API_KEY`, `GEMINI_MODEL`, `FLIP_IMAGE=1`, `CAM_HEIGHT_M` (measure it!), `USE_DEPTH=0`, `RING_HAND=left`, `USE_PLANNER=0`, `USE_OPEN_VOCAB=0`, `OPEN_VOCAB_CONF` (default 0.15).
 
+ElevenLabs speech is proxied through `POST /tts`. Set `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` in the Orin environment before starting the server. If you keep them in an uncommitted `.env` file, load it with `set -a; source .env; set +a` first. The repository's `.gitignore` excludes `.env` files.
+
 Path planning: depth + ARKit build a floor map; A* routes around obstacles in GOTO mode (dashboard **Map** view). The map stays blank with `fake_phone.py` (it sends `tracking:false`).
 
 "Find my …" asks the local YOLO-World detector first; Gemini is the fallback.

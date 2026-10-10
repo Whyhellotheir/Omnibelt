@@ -17,7 +17,7 @@ struct ContentView: View {
                     streamer.stop(); voice.stop()
                 } else {
                     streamer.start(host: host, voice: voice)
-                    voice.start(streamer: streamer)
+                    voice.start(streamer: streamer, host: host)
                 }
             }
             .font(.title).buttonStyle(.borderedProminent)

@@ -1,4 +1,5 @@
 import ARKit
+import AVFoundation
 import Vision
 import CoreImage
 import UIKit
@@ -7,6 +8,11 @@ import Combine
 /// Streams camera frames, ARKit pose and hand points to the Orin over a WebSocket,
 /// and hands any {"type":"say"} reply to VoiceIO.
 final class BeltStreamer: NSObject, ObservableObject, ARSessionDelegate {
+    private enum CameraMode: String {
+        case navigation = "1x"
+        case localSearch = "0.5x"
+    }
+
     @Published var running = false
     @Published var status = "Idle"
 
@@ -21,20 +27,17 @@ final class BeltStreamer: NSObject, ObservableObject, ARSessionDelegate {
     private var seq = 0
     private var sentSince = Date()
     private var sentCount = 0
+    private var cameraMode = CameraMode.navigation
     private weak var voice: VoiceIO?
 
     func start(host: String, voice: VoiceIO) {
         self.host = host
         self.voice = voice
         connect()
-        let config = ARWorldTrackingConfiguration()
-        config.planeDetection = [.horizontal, .vertical]
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            config.frameSemantics.insert(.sceneDepth)          // LiDAR phones only
-        }
         session.delegate = self
         session.delegateQueue = DispatchQueue(label: "navbelt.ar")
-        session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        cameraMode = .navigation
+        session.run(configuration(for: .navigation), options: [.resetTracking, .removeExistingAnchors])
         running = true
     }
 
@@ -42,7 +45,54 @@ final class BeltStreamer: NSObject, ObservableObject, ARSessionDelegate {
         running = false
         session.pause()
         socket?.cancel(with: .goingAway, reason: nil)
+        cameraMode = .navigation
         status = "Stopped"
+    }
+
+    private func configuration(for mode: CameraMode) -> ARWorldTrackingConfiguration {
+        let config = ARWorldTrackingConfiguration()
+        config.planeDetection = [.horizontal, .vertical]
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            config.frameSemantics.insert(.sceneDepth)
+        }
+
+        let requestedDevice: AVCaptureDevice.DeviceType = mode == .localSearch
+            ? .builtInUltraWideCamera
+            : .builtInWideAngleCamera
+        if let format = ARWorldTrackingConfiguration.supportedVideoFormats.first(where: {
+            $0.captureDeviceType == requestedDevice
+        }) {
+            config.videoFormat = format
+        }
+        return config
+    }
+
+    private func setCameraMode(_ requestedMode: CameraMode) {
+        guard running, requestedMode != cameraMode else { return }
+        if requestedMode == .localSearch,
+           !ARWorldTrackingConfiguration.supportedVideoFormats.contains(where: {
+               $0.captureDeviceType == .builtInUltraWideCamera
+           }) {
+            DispatchQueue.main.async {
+                self.status = "Local search · 0.5x unavailable, using 1x"
+            }
+            return
+        }
+
+        cameraMode = requestedMode
+        session.run(configuration(for: requestedMode))
+        DispatchQueue.main.async {
+            self.status = requestedMode == .localSearch ? "Local search · 0.5x" : "Navigation · 1x"
+        }
+    }
+
+    private func updateCameraMode(forSpokenText text: String) {
+        let normalized = text.lowercased()
+        if normalized.contains("right in front of you") || normalized.contains("reach out") {
+            setCameraMode(.localSearch)
+        } else if normalized.hasPrefix("got it") || normalized.hasPrefix("stopped") {
+            setCameraMode(.navigation)
+        }
     }
 
     // MARK: - WebSocket
@@ -66,8 +116,13 @@ final class BeltStreamer: NSObject, ObservableObject, ARSessionDelegate {
                 if case .string(let text) = message,
                    let data = text.data(using: .utf8),
                    let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   obj["type"] as? String == "say", let say = obj["text"] as? String {
-                    DispatchQueue.main.async { self.voice?.say(say) }
+                   let type = obj["type"] as? String {
+                    if type == "say", let say = obj["text"] as? String {
+                        self.updateCameraMode(forSpokenText: say)
+                        DispatchQueue.main.async { self.voice?.say(say) }
+                    } else if type == "camera_mode", let mode = obj["mode"] as? String {
+                        self.setCameraMode(mode == "search" ? .localSearch : .navigation)
+                    }
                 }
                 self.receive()
             }
@@ -75,6 +130,10 @@ final class BeltStreamer: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     func sendCommand(_ text: String) {
+        let normalized = text.lowercased()
+        if normalized.contains("find") || normalized.contains("locate") || normalized.contains("where") {
+            setCameraMode(.navigation)
+        }
         sendJSON(["type": "cmd", "text": text])
     }
 
@@ -95,7 +154,6 @@ final class BeltStreamer: NSObject, ObservableObject, ARSessionDelegate {
         let depth = frame.sceneDepth?.depthMap
         work.async { [weak self] in
             self?.process(pixels: pixels, camera: camera, depth: depth, time: now)
-            self?.busy = false
         }
     }
 
@@ -108,7 +166,10 @@ final class BeltStreamer: NSObject, ObservableObject, ARSessionDelegate {
         // 1. Higher-detail JPEG so a hand and the object it is holding remain distinguishable.
         let scaled = CIImage(cvPixelBuffer: pixels).transformed(by: CGAffineTransform(scaleX: sx, y: sy))
         guard let cg = ciContext.createCGImage(scaled, from: CGRect(x: 0, y: 0, width: outW, height: outH)),
-              let jpeg = UIImage(cgImage: cg).jpegData(compressionQuality: Config.jpegQuality) else { return }
+              let jpeg = UIImage(cgImage: cg).jpegData(compressionQuality: Config.jpegQuality) else {
+            busy = false
+            return
+        }
 
         // 2. Hands (Apple Vision), in transmitted-image coordinates, origin top-left
         var hands: [[String: Any]] = []
@@ -168,18 +229,55 @@ final class BeltStreamer: NSObject, ObservableObject, ARSessionDelegate {
                                    "yaw": Double(camera.eulerAngles.y), "pitch": Double(camera.eulerAngles.x),
                                    "T": T.map { Double($0) }, "intr": intr, "hands": hands,
                                    "width": Config.frameWidth, "height": Config.frameHeight,
+                                   "camera": cameraMode.rawValue,
                                    "depth": depthData != nil, "dw": 128, "dh": 96]
-        sendJSON(meta)
-        socket?.send(.data(jpeg)) { _ in }
-        if let dd = depthData { socket?.send(.data(dd)) { _ in } }
+        sendFrame(metadata: meta, jpeg: jpeg, depth: depthData)
 
         sentCount += 1
         if Date().timeIntervalSince(sentSince) > 1 {
             let fps = Double(sentCount) / Date().timeIntervalSince(sentSince)
             let hc = hands.count
-            DispatchQueue.main.async { self.status = String(format: "Streaming %.0f fps · hands: %d", fps, hc) }
+            let activeCamera = cameraMode.rawValue
+            DispatchQueue.main.async {
+                self.status = String(format: "Streaming %.0f fps · %@ · hands: %d", fps, activeCamera, hc)
+            }
             sentCount = 0
             sentSince = Date()
+        }
+    }
+
+    private func sendFrame(metadata: [String: Any], jpeg: Data, depth: Data?) {
+        guard let metadataData = try? JSONSerialization.data(withJSONObject: metadata),
+              let metadataText = String(data: metadataData, encoding: .utf8),
+              let socket else {
+            finishSendingFrame()
+            return
+        }
+
+        socket.send(.string(metadataText)) { [weak self, weak socket] error in
+            guard let self, error == nil, let socket else {
+                self?.finishSendingFrame()
+                return
+            }
+            socket.send(.data(jpeg)) { [weak self, weak socket] error in
+                guard let self, error == nil, let socket else {
+                    self?.finishSendingFrame()
+                    return
+                }
+                guard let depth else {
+                    self.finishSendingFrame()
+                    return
+                }
+                socket.send(.data(depth)) { [weak self] _ in
+                    self?.finishSendingFrame()
+                }
+            }
+        }
+    }
+
+    private func finishSendingFrame() {
+        work.async { [weak self] in
+            self?.busy = false
         }
     }
 

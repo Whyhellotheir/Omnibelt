@@ -30,11 +30,13 @@ Threads: perception (YOLO + depth + map update every frame) -> planner (2.5 Hz) 
          refresher (re-finds the target) ; memory (logs where objects were seen).
 """
 import asyncio, glob, json, math, os, re, threading, time
+import urllib.error
+import urllib.request
 import numpy as np
 import cv2
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, Response
 
 # ----------------------------------------------------------------- settings
 YOLO_ENGINE = os.environ.get("YOLO_ENGINE", "yolo11n.engine")
@@ -84,6 +86,8 @@ LOOKAHEAD_M = 0.8          # steer toward the point this far along the route
 OBST_MIN_H, OBST_MAX_H = 0.15, 1.9   # only things between ankle and head height count as obstacles
 RING = 8
 W, H = 640, 480
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "")
 
 INTENT_PROMPT = ("You control a navigation belt for a blind user. Convert the spoken request into JSON "
                  '{"intent": "find|where|follow|goto|describe|ask|stop|walk", "target": "short noun phrase or empty"}. '
@@ -1168,6 +1172,34 @@ async def state():
 async def cmd(payload: dict = Body(...)):
     threading.Thread(target=handle_command, args=(payload.get("text", ""),), daemon=True).start()
     return {"ok": True}
+
+
+def request_speech(text):
+    url = (f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+           "?output_format=mp3_44100_128")
+    body = json.dumps({"text": text, "model_id": "eleven_flash_v2_5"}).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+    })
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return response.read()
+
+
+@app.post("/tts")
+async def text_to_speech(payload: dict = Body(...)):
+    text = payload.get("text")
+    if not isinstance(text, str) or not text.strip() or len(text) > 500:
+        raise HTTPException(status_code=400, detail="text must contain 1 to 500 characters")
+    if not ELEVENLABS_API_KEY or not ELEVENLABS_VOICE_ID:
+        raise HTTPException(status_code=503, detail="ElevenLabs is not configured")
+    try:
+        audio = await asyncio.to_thread(request_speech, text.strip())
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
+        print("ElevenLabs error:", error)
+        raise HTTPException(status_code=502, detail="ElevenLabs request failed") from error
+    return Response(content=audio, media_type="audio/mpeg")
 
 
 @app.get("/")
