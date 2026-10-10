@@ -14,3 +14,8 @@ A haptic navigation belt and ring for blind and low-vision users, built at Knigh
 For architecture, interfaces and the current status, see [CLAUDE.md](CLAUDE.md).
 
 API keys go in environment variables only. Never commit them.
+
+## Orin quick start
+    pip install fastapi uvicorn pyserial google-genai transformers pillow websockets
+    export GEMINI_API_KEY=...
+    python3 vision/orin/navbelt_server.py        # dashboard at http://orin.local:8765/

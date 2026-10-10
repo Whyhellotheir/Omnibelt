@@ -25,3 +25,6 @@ xcuserdata/
 
 # cad output
 *.stl
+
+# local clone folder
+/Omnibelt/

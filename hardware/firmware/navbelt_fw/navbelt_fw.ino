@@ -27,7 +27,7 @@ const int PINS[NUM] = {13, 14, 33, 25, 26, 27, 32, 12};
 
 const int   PWM_FREQ    = 20000;   // above hearing range
 const int   PWM_BITS    = 8;       // 0..255
-const float DUTY_CAP    = 1.0;    // 100 % command = 65 % real
+const float DUTY_CAP    = 0.65;    // 100 % command = 65 % real
 const int   MAX_ON      = 3;
 const unsigned long WATCHDOG_MS = 500;
 

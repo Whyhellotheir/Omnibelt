@@ -130,9 +130,10 @@ After checkpoint 3: freeze, rehearse the 90 s demo five times, and record a back
 - Pull before you push. Small commits, staged by file name.
 
 ## Open issues
-- **DUTY_CAP mismatch:** `hardware/firmware/navbelt_fw/navbelt_fw.ino:30` has `DUTY_CAP = 1.0`, but both docs and the line's own comment say 65% (these are 3V motors running on ~4V). The older build-kit copy had `0.65`. Hardware needs to decide which value is right.
+- **DUTY_CAP:** `hardware/firmware/navbelt_fw/navbelt_fw.ino:30` is `0.65` (matches the docs; 3V motors on ~4V). Hieu's local navbelt_code had `1.0`; if pulses are too weak, raise it here deliberately.
 - Does the team have a Mac? Without one, the phone side becomes a browser page served by the Orin.
 - Sponsor LiDAR? Battery 15V label? Demo wearer's ring size?
 
 ## Worklog
 - 2026-10-10: Repo seeded from `navbelt_code.zip` and split into hardware/software/vision/ai. CLAUDE.md written from the design doc and build guide.
+- 2026-10-10: Merged Jayce's flat initial commit; files moved into track folders, firmware kept at DUTY_CAP 0.65.
