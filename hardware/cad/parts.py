@@ -11,7 +11,7 @@ Belt/chest parts are exported standing on their X = 0 end, which is how they
 print: belt tunnels and walls run vertically, so they need NO supports.
 Ring, wrist pod, lids and shims are exported flat, also support-free.
 """
-import os
+import os, math
 import numpy as np
 import trimesh
 from manifold3d import Manifold as M, CrossSection as CS, JoinType, set_circular_segments
@@ -409,3 +409,67 @@ def holder_print_orientation(m):
     """Stand it upright on the bottom edge of the plate and pads (backplate vertical): no supports."""
     m = m.rotate([90.0 - UNI["tilt"], 0, 0])
     return on_bed(m)
+
+
+# ---------------------------------------------------------------- SWAP RING SYSTEM (all sizes, one motor capsule)
+# Each ring has a dovetail socket on top. The motor lives in a small capsule that slides into ANY ring
+# from the fingertip side and stops against the wrist-side end, so the wire's pull holds it in place.
+# The motor face sits flush with the capsule's underside and touches the finger through the window.
+SW = dict(band_t=2.0, band_h=6.0, H=14.0, a0=6.8, a1=5.8, dt_h=5.0, neck=0.3, plate_t=2.0, plate_w=7.6,
+          clr=0.2, floor=1.2, frame_w=9.6)
+
+def swap_capsule():
+    """capsule frame: x tangential, y = 0 at the face that touches the finger, z = along the finger (0 = wrist end)."""
+    s = SW
+    L = s["H"] - s["floor"] - 0.3
+    dt = CS([[[-s["a0"], 0], [s["a0"], 0], [s["a1"], s["dt_h"]], [-s["a1"], s["dt_h"]]]]).extrude(L)
+    neck = box(-s["a1"], s["a1"], s["dt_h"] - 0.01, s["dt_h"] + s["neck"], 0, L)
+    yp = s["dt_h"] + s["neck"]
+    plate = rounded_box_flat(-s["plate_w"], s["plate_w"], yp, yp + s["plate_t"], 0, L, 1.5) if False else \
+        CS.square([2 * s["plate_w"] - 2, s["plate_t"] - 2 + 0.01], True).offset(1.0, JoinType.Round).translate([0, yp + s["plate_t"] / 2]).extrude(L)
+    cap = dt + neck + plate
+    cap -= M.cylinder(2.6, MOTOR_D / 2, MOTOR_D / 2).rotate([-90, 0, 0]).translate([0, -0.01, L / 2])   # motor pocket, open to the finger: 3 mm motor sticks out 0.4 mm
+    cap -= box(-1.3, 1.3, -0.01, 1.8, -1, L / 2)                                  # lead groove to the wrist end
+    return cap, L
+
+
+def swap_ring(us_size):
+    """ring frame: finger axis = z, socket on top (+y). z = 0 is the wrist end (the stop)."""
+    s = SW
+    ri = ring_inner_d(us_size) / 2
+    yb = ri + 0.3                                       # capsule underside (touches the finger)
+    band = M.cylinder(s["band_h"], ri + s["band_t"], ri + s["band_t"]) - M.cylinder(s["band_h"] + 2, ri, ri).translate([0, 0, -1])
+    top = yb + s["dt_h"] + 0.15
+    ftop = top + 0.1
+    frame = (CS.square([2 * s["frame_w"] - 4, ftop - (ri - 1.5) - 4], True).offset(2.0, JoinType.Round)
+             .translate([0, (ftop + ri - 1.5) / 2]).extrude(s["H"]))
+    r = band + frame
+    r -= M.cylinder(60, ri, ri).translate([0, 0, -20])                              # the finger
+    c0, c1 = s["a0"] + s["clr"], s["a1"] + s["clr"]
+    chan = CS([[[-c0, yb - 6], [c0, yb - 6], [c0, yb], [c1, top], [-c1, top], [-c0, yb]]]).extrude(s["H"] + 2).translate([0, 0, s["floor"]])
+    chan += box(-c1, c1, top - 0.5, top + 5, s["floor"], s["H"] + 2)               # open top for the capsule neck
+    r -= chan
+    r -= box(-1.6, 1.6, yb - 3, yb + 2.0, -1, s["floor"] + 0.5)                     # lead notch through the stop
+    n = int(us_size) - 6                                                            # size marker: dots = size - 6
+    for k in range(n):
+        a = math.radians(-90 + (k - (n - 1) / 2) * 12)
+        r -= M.cylinder(4, 0.7, 0.7).rotate([0, 90, 0]).rotate([0, 0, math.degrees(a)]).translate(
+            [(ri + s["band_t"] - 0.6) * math.cos(a), (ri + s["band_t"] - 0.6) * math.sin(a), s["band_h"] / 2])
+    return r, yb
+
+
+def capsule_print():
+    cap, _ = swap_capsule()
+    return on_bed(cap.rotate([-90, 0, 0]))               # top plate on the bed, motor pocket facing up
+
+
+def swap_ring_plate(n_capsules=3):
+    """All six ring sizes + spare motor capsules on one print bed. Every part prints flat, no supports."""
+    out = None
+    for i, size in enumerate(RING_SIZES):
+        r = swap_ring(size)[0].translate([(i % 3) * 36.0, (i // 3) * 40.0, 0])
+        out = r if out is None else out + r
+    for k in range(n_capsules):
+        c = capsule_print()
+        out += c.translate([-8.0 + k * 24.0, 70.0, 0])
+    return on_bed(out)

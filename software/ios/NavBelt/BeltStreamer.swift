@@ -144,8 +144,11 @@ final class BeltStreamer: NSObject, ObservableObject, ARSessionDelegate {
         var depthData: Data? = nil
         if let d = depth { depthData = Self.downsample(depth: d, toW: 128, toH: 96) }
 
+        var tracking = false
+        if case .normal = camera.trackingState { tracking = true }   // map + route planning only when ARKit is confident
+
         seq += 1
-        let meta: [String: Any] = ["type": "frame", "seq": seq, "t": time,
+        let meta: [String: Any] = ["type": "frame", "seq": seq, "t": time, "tracking": tracking,
                                    "yaw": Double(camera.eulerAngles.y), "pitch": Double(camera.eulerAngles.x),
                                    "T": T.map { Double($0) }, "intr": intr, "hands": hands,
                                    "depth": depthData != nil, "dw": 128, "dh": 96]

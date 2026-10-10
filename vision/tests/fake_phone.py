@@ -40,7 +40,7 @@ async def main():
                 continue
             frame = cv2.resize(frame, (640, 480))
             meta = {"type": "frame", "seq": seq, "t": time.time(), "yaw": 0.0, "pitch": 0.0, "T": T,
-                    "intr": [500.0, 500.0, 320.0, 240.0], "hands": [], "depth": False}
+                    "intr": [500.0, 500.0, 320.0, 240.0], "hands": [], "depth": False, "tracking": False}
             await ws.send(json.dumps(meta))
             await ws.send(cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])[1].tobytes())
             while cmds:

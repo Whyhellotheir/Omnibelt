@@ -10,12 +10,15 @@ Run:
   python3 navbelt_server.py
 Settings (environment variables): FLIP_IMAGE=1 if the dashboard image is upside down,
 CAM_HEIGHT_M=1.0 for the belt cradle (1.3 chest), USE_DEPTH=0 to skip the depth model,
-RING_HAND=left if the ring is on the left hand, YOLO_ENGINE=path, GEMINI_MODEL=name,
+RING_HAND=left if the ring is on the left hand, YOLO_ENGINE=path, GEMINI_MODEL=name, USE_PLANNER=0 to
+use dodging only (no map / route planning),
 USE_OPEN_VOCAB=0 to turn off the find-anything detector, OPEN_VOCAB_CONF=0.25 if it finds wrong things.
 
 Finding objects: the local find-anything detector (YOLO-World) answers first, in a fraction of a
 second; Gemini is only asked when the local detector finds nothing (and for describe + memory).
-Threads: perception (YOLO + depth every frame) -> control (10 Hz motor commands) ;
+Path planning: depth + the phone's ARKit position build a floor map; A* plans a route to the goal around
+everything on it (including obstacles no longer in view); the dodge layer still checks every frame.
+Threads: perception (YOLO + depth + map update every frame) -> planner (2.5 Hz) -> control (10 Hz motors) ;
          refresher (re-finds the target) ; memory (logs where objects were seen).
 """
 import asyncio, glob, json, math, os, re, threading, time
@@ -47,6 +50,15 @@ MEMORY_CLASSES = ["keys", "wallet", "phone", "glasses", "cup", "bottle", "backpa
                   "remote", "laptop", "door", "chair"]
 # body angle of each belt motor in degrees, + = to the wearer's right. Measure on the wearer!
 MOTOR_ANGLES = {1: 0, 2: 45, 3: 90, 4: 120, 5: -120, 6: -90, 7: -45}
+# path planner: builds a floor map from depth + ARKit position, plans a route (A*) to the goal,
+# and the dodge layer still checks every frame. USE_PLANNER=0 = reactive dodging only.
+USE_PLANNER = os.environ.get("USE_PLANNER", "1") == "1"
+MAP_CELL_M = 0.15          # map resolution
+MAP_SIZE_M = 12.0          # map covers 12 x 12 m around the start point
+MAP_RANGE_M = 4.0          # only trust depth out to this distance
+BODY_RADIUS_M = 0.35       # keep the route this far from obstacles
+LOOKAHEAD_M = 0.8          # steer toward the point this far along the route
+OBST_MIN_H, OBST_MAX_H = 0.15, 1.9   # only things between ankle and head height count as obstacles
 RING = 8
 W, H = 640, 480
 
@@ -82,6 +94,9 @@ class State:
         self.fps = 0.0
         self.depth_source = "none"
         self.last_finder = ""
+        self.path, self.path_t = None, 0.0
+        self.map_vis = None
+        self.cols = None          # per-column nearest obstacle distance (64 columns), for the map
 
 
 S = State()
@@ -91,6 +106,7 @@ GEMINI_LOCK = threading.Lock()
 BELT = None
 BRAIN = None
 LOCAL = None
+GRID = None
 
 
 # ----------------------------------------------------------------- geometry
@@ -385,20 +401,182 @@ class Brain:
 
 
 # ----------------------------------------------------------------- perception thread
-def compute_sectors(depth, dets, meta):
-    dist = [9.9] * 16
+N_COLS = 64
+
+
+def obstacle_columns(depth, dets, meta):
+    """nearest obstacle distance in each of 64 image columns. With depth, only points between ankle and
+    head height count (so the floor never shows up as a wall). Without depth, YOLO box bottoms are used."""
+    cols = np.full(N_COLS, 9.9, np.float32)
     if depth is not None:
-        band = depth[int(H * 0.25):int(H * 0.80)]
-        cols = np.percentile(band, 10, axis=0)
-        for s in range(16):
-            dist[s] = float(cols[s * W // 16:(s + 1) * W // 16].min())
+        _, fy, _, cy = cam(meta)
+        pitch = pose(meta)[1]
+        rows = np.arange(0, H, 4)
+        elev = np.radians(pitch + np.degrees(np.arctan2(cy - rows, fy)))         # angle above horizontal, per row
+        d = depth[rows][:, :N_COLS * (W // N_COLS)].reshape(len(rows), N_COLS, W // N_COLS).min(axis=2)
+        height = CAM_HEIGHT_M + d * np.tan(elev)[:, None]
+        ok = (height > OBST_MIN_H) & (height < OBST_MAX_H) & (d > 0.2)
+        dd = np.where(ok, d, 9.9)
+        cols = np.percentile(dd, 5, axis=0).astype(np.float32)
     else:
-        for d in dets:
-            x0, y0, x1, y1 = d["box"]
-            dd = floor_dist(y1, meta) if y1 < H - 3 else 0.8
-            for s in range(max(0, int(x0 * 16 / W)), min(15, int(x1 * 16 / W)) + 1):
-                dist[s] = min(dist[s], dd)
-    return [x < OBSTACLE_M for x in dist], dist
+        for det in dets:
+            x0, y0, x1, y1 = det["box"]
+            dist = floor_dist(y1, meta) if y1 < H - 3 else 0.8
+            c0, c1 = max(0, int(x0 * N_COLS / W)), min(N_COLS - 1, int(x1 * N_COLS / W))
+            cols[c0:c1 + 1] = np.minimum(cols[c0:c1 + 1], dist)
+    return cols
+
+
+def compute_sectors(depth, dets, meta):
+    cols = obstacle_columns(depth, dets, meta)
+    dist = [float(cols[s * 4:(s + 1) * 4].min()) for s in range(16)]
+    return [x < OBSTACLE_M for x in dist], dist, cols
+
+
+# ----------------------------------------------------------------- floor map + A* planner
+class FloorMap:
+    """top-down occupancy grid in ARKit world coordinates (x right, z backward; start point = centre)."""
+    def __init__(self):
+        self.n = int(MAP_SIZE_M / MAP_CELL_M)
+        self.val = np.zeros((self.n, self.n), np.float32)      # >0 occupied evidence, <0 free evidence
+        self.lock = threading.Lock()
+        self.half = MAP_SIZE_M / 2
+
+    def to_cell(self, p):
+        return int((p[0] + self.half) / MAP_CELL_M), int((p[1] + self.half) / MAP_CELL_M)   # (col, row)
+
+    def to_world(self, c):
+        return np.array([(c[0] + 0.5) * MAP_CELL_M - self.half, (c[1] + 0.5) * MAP_CELL_M - self.half])
+
+    def inside(self, c):
+        return 0 <= c[0] < self.n and 0 <= c[1] < self.n
+
+    def update(self, meta, cols):
+        heading, _, pos = pose(meta)
+        with self.lock:
+            self.val *= 0.997                                  # slowly forget, so moved things disappear
+            for i, d in enumerate(cols):
+                bearing = px_bearing((i + 0.5) * W / N_COLS, meta)
+                wh = math.radians(heading + bearing)
+                direction = np.array([math.sin(wh), -math.cos(wh)])
+                hit = d < MAP_RANGE_M
+                reach = min(float(d), MAP_RANGE_M)
+                for t in np.arange(0.3, reach - MAP_CELL_M, MAP_CELL_M):       # free space along the ray
+                    c = self.to_cell(pos + t * direction)
+                    if self.inside(c):
+                        self.val[c[1], c[0]] = max(-3.0, self.val[c[1], c[0]] - 0.3)
+                if hit:
+                    c = self.to_cell(pos + reach * direction)
+                    if self.inside(c):
+                        self.val[c[1], c[0]] = min(5.0, self.val[c[1], c[0]] + 1.0)
+            c = self.to_cell(pos)                               # where you stand is free
+            r = int(0.4 / MAP_CELL_M)
+            if self.inside(c):
+                self.val[max(0, c[1] - r):c[1] + r + 1, max(0, c[0] - r):c[0] + r + 1] = np.minimum(
+                    self.val[max(0, c[1] - r):c[1] + r + 1, max(0, c[0] - r):c[0] + r + 1], -1.0)
+
+    def blocked_grid(self):
+        with self.lock:
+            occ = (self.val > 1.5).astype(np.uint8)
+        k = 2 * int(math.ceil(BODY_RADIUS_M / MAP_CELL_M)) + 1
+        return cv2.dilate(occ, np.ones((k, k), np.uint8)), occ
+
+    def plan(self, start, goal):
+        """A* over the inflated grid; returns a list of world points from start to goal, or None."""
+        import heapq
+        blocked, occ = self.blocked_grid()
+        clearance = cv2.distanceTransform((1 - occ).astype(np.uint8), cv2.DIST_L2, 3) * MAP_CELL_M
+        s, g = self.to_cell(start), self.to_cell(goal)
+        if not (self.inside(s) and self.inside(g)):
+            return None
+        blocked[s[1], s[0]] = 0
+        if blocked[g[1], g[0]]:                                 # goal inside an obstacle (e.g. the door frame):
+            free = np.argwhere(blocked == 0)                    # aim for the nearest free cell instead
+            if not len(free):
+                return None
+            k = np.argmin((free[:, 1] - g[0]) ** 2 + (free[:, 0] - g[1]) ** 2)
+            g = (int(free[k, 1]), int(free[k, 0]))
+        steps = [(1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
+                 (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414)]
+        openq = [(0.0, s)]
+        came, cost = {s: None}, {s: 0.0}
+        while openq:
+            _, cur = heapq.heappop(openq)
+            if cur == g:
+                break
+            for dx, dy, w in steps:
+                nx, ny = cur[0] + dx, cur[1] + dy
+                if not (0 <= nx < self.n and 0 <= ny < self.n) or blocked[ny, nx]:
+                    continue
+                near = max(0.0, 0.8 - float(clearance[ny, nx]))          # prefer routes away from obstacles
+                nc = cost[cur] + w * (1.0 + 3.0 * near)
+                if nc < cost.get((nx, ny), 1e9):
+                    cost[(nx, ny)] = nc
+                    came[(nx, ny)] = cur
+                    heapq.heappush(openq, (nc + math.hypot(g[0] - nx, g[1] - ny), (nx, ny)))
+        if g not in came:
+            return None
+        path, c = [], g
+        while c is not None:
+            path.append(self.to_world(c))
+            c = came[c]
+        return path[::-1]
+
+    def render(self, meta, path, target):
+        with self.lock:
+            v = self.val.copy()
+        img = np.full((self.n, self.n, 3), 130, np.uint8)
+        img[v < -0.5] = (235, 235, 235)
+        img[v > 1.5] = (25, 25, 25)
+        img = cv2.resize(img, (480, 480), interpolation=cv2.INTER_NEAREST)
+        sc = 480 / self.n
+        px = lambda p: (int((p[0] + self.half) / MAP_CELL_M * sc), int((p[1] + self.half) / MAP_CELL_M * sc))
+        if path:
+            cv2.polylines(img, [np.array([px(p) for p in path], np.int32)], False, (0, 140, 255), 3)
+        if target is not None:
+            cv2.circle(img, px(target), 9, (40, 40, 220), -1)
+        if meta is not None:
+            heading, _, pos = pose(meta)
+            p = px(pos)
+            tip = px(pos + 0.6 * np.array([math.sin(math.radians(heading)), -math.cos(math.radians(heading))]))
+            cv2.circle(img, p, 8, (60, 200, 60), -1)
+            cv2.line(img, p, tip, (60, 200, 60), 3)
+        cv2.putText(img, "black = obstacle, orange = route, red = goal, green = you", (10, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        return cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 75])[1].tobytes()
+
+
+def tracking_ok(meta):
+    return meta is not None and meta.get("T") is not None and meta.get("tracking", True)
+
+
+def planner_loop():
+    while True:
+        time.sleep(0.4)
+        if GRID is None:
+            continue
+        with S.lock:
+            mode, tgt, meta = S.mode, S.target, S.meta
+        path = None
+        if USE_PLANNER and tracking_ok(meta) and mode == "GOTO" and tgt and tgt.get("pos") is not None:
+            try:
+                path = GRID.plan(pose(meta)[2], tgt["pos"])
+            except Exception as e:
+                print("planner error:", e)
+        with S.lock:
+            S.path, S.path_t = path, time.time()
+        if tracking_ok(meta):
+            S.map_vis = GRID.render(meta, path, tgt.get("pos") if tgt else None)
+
+
+def route_bearing(meta, path):
+    """pure pursuit: direction (body angle) to the route point LOOKAHEAD_M ahead of the wearer."""
+    heading, _, pos = pose(meta)
+    look = path[-1]
+    for p in path:
+        if np.hypot(*(p - pos)) >= LOOKAHEAD_M:
+            look = p
+            break
+    return wrap(heading_to(pos, look)[0] - heading)
 
 
 def draw(frame, meta, dets, blocked, depth):
@@ -475,7 +653,9 @@ def perception_loop():
             source = "estimated"
         else:
             depth = None
-        blocked, dist = compute_sectors(depth, dets, meta)
+        blocked, dist, cols = compute_sectors(depth, dets, meta)
+        if USE_PLANNER and GRID is not None and tracking_ok(meta):
+            GRID.update(meta, cols)
         n += 1
         with S.lock:
             S.dets, S.depth, S.blocked, S.dist, S.depth_source = dets, depth, blocked, dist, source
@@ -519,6 +699,7 @@ def start_reach(tgt):
 
 
 def start_find(target, walk_only=False):
+    own = "the" if walk_only else "your"
     frame, meta, depth = latest()
     if frame is None:
         say("I'm not getting any video yet.")
@@ -541,11 +722,11 @@ def start_find(target, walk_only=False):
         rel = wrap(heading_to(pos, mem["pos"])[0] - heading)
         set_mode("GOTO", {"label": target, "pos": mem["pos"], "dist": None, "box": None, "in_view": False,
                           "walk_only": walk_only})
-        say(f"I last saw your {target} {direction_words(rel)}, {int(time.time() - mem['t'])} seconds ago. Follow the belt.")
+        say(f"I last saw {own} {target} {direction_words(rel)}, {int(time.time() - mem['t'])} seconds ago. Follow the belt.")
         return
     set_mode("SEARCH", {"label": target, "pos": None, "box": None, "in_view": False, "walk_only": walk_only,
                         "started": time.time()})
-    say(f"I can't see your {target} yet. Turn slowly and I'll keep looking.")
+    say(f"I can't see {own} {target} yet. Turn slowly and I'll keep looking.")
 
 
 def start_follow(desc):
@@ -676,6 +857,10 @@ def control_loop():
                 continue
             th, gdist = heading_to(pos, tgt["pos"])
             goal = wrap(th - heading)
+            with S.lock:
+                path, path_t = S.path, S.path_t
+            if path and len(path) > 1 and time.time() - path_t < 1.5:
+                goal = route_bearing(meta, path)               # follow the planned route around obstacles
         elif mode == "FOLLOW":
             p = next((d for d in dets if d["id"] == (tgt or {}).get("follow_id")), None)
             if p is None:
@@ -858,6 +1043,11 @@ async def video_depth():
     return mjpeg(lambda: S.depth_vis)
 
 
+@app.get("/video/map")
+async def video_map():
+    return mjpeg(lambda: S.map_vis)
+
+
 @app.get("/state")
 async def state():
     with S.lock:
@@ -866,6 +1056,7 @@ async def state():
             "mode": S.mode, "fps": round(S.fps, 1), "motors": {str(k): v for k, v in S.motors.items()},
             "heard": S.last_heard, "said": S.last_said, "target": tgt.get("label"), "finder": S.last_finder,
             "depth": S.depth_source, "phone": PHONE["ws"] is not None,
+            "planner": ("route" if S.path else "dodge only") if USE_PLANNER else "off",
             "memory": sorted([[k, int(time.time() - v["t"])] for k, v in S.memory.items()], key=lambda kv: kv[1])[:8]})
 
 
@@ -899,17 +1090,18 @@ input{font:inherit;padding:8px;border-radius:8px;border:1px solid #555;backgroun
 <button id="b-cam" class="on" onclick="view('cam')">Camera</button>
 <button id="b-depth" onclick="view('depth')">Depth</button>
 <button id="b-split" onclick="view('split')">Split</button>
+<button id="b-map" onclick="view('map')">Map</button>
 <span id="phone"></span></header>
-<main><div class="views"><img id="cam" src="/video/camera"><img id="depth" src="/video/depth" style="display:none"></div>
+<main><div class="views"><img id="cam" src="/video/camera"><img id="depth" src="/video/depth" style="display:none"><img id="map" src="/video/map" style="display:none;max-width:480px"></div>
 <aside><svg id="belt" viewBox="-110 -110 220 220" width="300" height="300"></svg>
 <div id="status"></div>
 <p><input id="cmd" placeholder="Type a command, e.g. find my keys" onkeydown="if(event.key==='Enter')send()"></p>
 <div id="memory"></div></aside></main>
 <script>
 const ANG={1:0,2:45,3:90,4:120,5:-120,6:-90,7:-45};
-function view(v){document.getElementById('cam').style.display=v==='depth'?'none':'';
-document.getElementById('depth').style.display=v==='cam'?'none':'';
-for(const k of ['cam','depth','split'])document.getElementById('b-'+k).className=k===v?'on':'';}
+function view(v){const show={cam:['cam'],depth:['depth'],split:['cam','depth'],map:['cam','map']}[v];
+for(const k of ['cam','depth','map'])document.getElementById(k).style.display=show.includes(k)?'':'none';
+for(const k of ['cam','depth','split','map'])document.getElementById('b-'+k).className=k===v?'on':'';}
 function send(){const i=document.getElementById('cmd');fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:i.value})});i.value='';}
 function belt(m){let s='<circle r="80" fill="none" stroke="#444" stroke-width="6"/><text y="-92" text-anchor="middle" fill="#888" font-size="14">front</text>';
 for(const k in ANG){const a=ANG[k]*Math.PI/180,x=80*Math.sin(a),y=-80*Math.cos(a),on=m[k];
@@ -918,7 +1110,7 @@ const r=m['8'];s+=`<circle r="${r?24:16}" fill="${r?'#ff9f0a':'#333'}"/><text y=
 document.getElementById('belt').innerHTML=s;}
 async function tick(){try{const s=await (await fetch('/state')).json();belt(s.motors);
 document.getElementById('phone').textContent=s.phone?'phone connected':'phone NOT connected';
-document.getElementById('status').innerHTML=`Mode: <b>${s.mode}</b>${s.target?' ('+s.target+')':''}<br>Heard: ${s.heard||'-'}<br>Said: ${s.said||'-'}<br>Found by: ${s.finder||'-'}<br>${s.fps} fps, depth: ${s.depth}`;
+document.getElementById('status').innerHTML=`Mode: <b>${s.mode}</b>${s.target?' ('+s.target+')':''}<br>Heard: ${s.heard||'-'}<br>Said: ${s.said||'-'}<br>Found by: ${s.finder||'-'}<br>Path: ${s.planner}<br>${s.fps} fps, depth: ${s.depth}`;
 document.getElementById('memory').innerHTML=s.memory.length?'<b>Last seen</b><br>'+s.memory.map(m=>`${m[0]} - ${m[1]} s ago`).join('<br>'):'';}catch(e){}}
 setInterval(tick,200);belt({});
 </script></body></html>"""
@@ -928,7 +1120,8 @@ if __name__ == "__main__":
     BELT = Belt()
     LOCAL = LocalFinder()
     BRAIN = Brain()
-    for fn in (perception_loop, control_loop, refresher_loop, memory_loop):
+    GRID = FloorMap()
+    for fn in (perception_loop, control_loop, refresher_loop, memory_loop, planner_loop):
         threading.Thread(target=fn, daemon=True).start()
     print("Dashboard: http://orin.local:8765/   phone socket: ws://<this-ip>:8765/stream")
     uvicorn.run(app, host="0.0.0.0", port=8765, log_level="warning")
