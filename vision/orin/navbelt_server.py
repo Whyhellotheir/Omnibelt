@@ -13,6 +13,14 @@ CAM_HEIGHT_M=1.0 belt cradle (default; set 1.3 for the chest), USE_DEPTH=0 to sk
 RING_HAND=left if the ring is on the left hand, YOLO_ENGINE=path, GEMINI_MODEL=name, USE_PLANNER=0 to
 use dodging only (no map / route planning),
 USE_OPEN_VOCAB=0 to turn off the find-anything detector, OPEN_VOCAB_CONF=0.25 if it finds wrong things.
+GEMINI_FIND_CONF=0.6: Gemini finds it rates below this are ignored (raise if it finds things that aren't there).
+Gemini models: GEMINI_MODEL then GEMINI_FALLBACK=a,b,... answer what the user asks (find, ask, describe);
+GEMINI_LIGHT (default gemini-3.5-flash-lite) does background scans/re-finds and command parsing, so they never use
+the Flash models' small daily quota. GEMINI_TIMEOUT_S=12 gives up on a slow model.
+GEMINI_LIGHT_FIND_CONF=0.8: stricter confidence for background re-finds (Flash-Lite guesses more).
+Gemini quota: GEMINI_MAX_PER_MIN=4 caps background calls per minute, GEMINI_MEMORY_EVERY_S=60 sets the
+memory scan interval (0 = off), GEMINI_REFRESH_S=3 sets how often Gemini re-finds a target the local
+detector misses. Spoken requests (find, describe, unusual commands) are never skipped.
 
 Finding objects: the local find-anything detector (YOLO-World) answers first, in a fraction of a
 second; Gemini is only asked when the local detector finds nothing (and for describe + memory).
@@ -32,20 +40,35 @@ from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 YOLO_ENGINE = os.environ.get("YOLO_ENGINE", "yolo11n.engine")
 USE_DEPTH = os.environ.get("USE_DEPTH", "1") == "1"
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
+# Two tiers, to fit the free-tier quotas (each Flash model ~20 requests/day and 5/min; Flash-Lite ~500/day, 15/min):
+#  - smart (GEMINI_MODEL, then GEMINI_FALLBACK in order): what the user asked for - find, ask, describe.
+#    Each model has its own daily quota, so the chain pools them.
+#  - light (GEMINI_LIGHT): everything in the background - memory scan, re-finding a target - plus parsing commands.
+#    Background calls never touch the smart tier's quota.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_FALLBACK = [m.strip() for m in os.environ.get("GEMINI_FALLBACK",
+                   "gemini-3.7-flash,gemini-3.6-flash,gemini-3-flash").split(",") if m.strip()]
+GEMINI_LIGHT = [m.strip() for m in os.environ.get("GEMINI_LIGHT", "gemini-3.5-flash-lite").split(",") if m.strip()]
+GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_TIMEOUT_S", "12"))
+THINKS = [dict(thinking_budget=0), dict(thinking_level="minimal"), dict(thinking_level="low"), None]
 FLIP_IMAGE = os.environ.get("FLIP_IMAGE", "0") == "1"
 CAM_HEIGHT_M = float(os.environ.get("CAM_HEIGHT_M", "1.0"))   # phone on the belt at the navel (chest cradle: 1.3)
 RING_HAND = os.environ.get("RING_HAND", "right")
 OBSTACLE_M = 1.0          # closer than this = blocked
 REACH_M = 0.9             # closer than this = switch from belt to ring
-MEMORY_EVERY_S = 8          # Gemini memory scan (slow, smart)
+MEMORY_EVERY_S = float(os.environ.get("GEMINI_MEMORY_EVERY_S", "60"))  # Gemini memory scan; 0 = off
 LOCAL_MEMORY_EVERY_S = 3    # find-anything memory scan (fast, local)
 REFRESH_LOCAL_S = 0.4       # how often the target is re-found with the local detector
-REFRESH_GEMINI_S = 1.5      # ...and with Gemini when there is no local detector
+REFRESH_GEMINI_S = float(os.environ.get("GEMINI_REFRESH_S", "3"))     # ...and with Gemini when that misses
+# Gemini quota: background calls (memory scan, re-finding) stop once this many calls were made in the
+# last minute, and pause for a minute after a rate-limit error. Spoken requests always go through.
+GEMINI_MAX_PER_MIN = int(os.environ.get("GEMINI_MAX_PER_MIN", "4"))
 # find-anything detector (YOLO-World): give it words, it finds them in every frame, on the Orin
 USE_OPEN_VOCAB = os.environ.get("USE_OPEN_VOCAB", "1") == "1"
 OPEN_VOCAB_MODEL = os.environ.get("OPEN_VOCAB_MODEL", "yolov8s-worldv2.pt")
 OPEN_VOCAB_CONF = float(os.environ.get("OPEN_VOCAB_CONF", "0.15"))
+GEMINI_FIND_CONF = float(os.environ.get("GEMINI_FIND_CONF", "0.6"))   # Gemini finds below this are ignored
+GEMINI_LIGHT_FIND_CONF = float(os.environ.get("GEMINI_LIGHT_FIND_CONF", "0.8"))  # stricter for Flash-Lite re-finds
 MEMORY_CLASSES = ["keys", "wallet", "phone", "glasses", "cup", "bottle", "backpack", "bag",
                   "remote", "laptop", "door", "chair"]
 # body angle of each belt motor in degrees, + = to the wearer's right. Measure on the wearer!
@@ -63,15 +86,23 @@ RING = 8
 W, H = 640, 480
 
 INTENT_PROMPT = ("You control a navigation belt for a blind user. Convert the spoken request into JSON "
-                 '{"intent": "find|where|follow|goto|describe|stop|walk", "target": "short noun phrase or empty"}. '
+                 '{"intent": "find|where|follow|goto|describe|ask|stop|walk", "target": "short noun phrase or empty"}. '
                  "find/where = locate an object; goto = walk to a place or thing (door, exit, chair); "
-                 "follow = follow a person (target = their description or empty). Request: ")
-FIND_PROMPT = ('Find "{target}" in this image. Return a JSON list of {{"label": string, '
-               '"box_2d": [ymin, xmin, ymax, xmax]}} with coordinates normalized to 0-1000, best match first. '
-               "Return [] if it is not visible.")
+                 "target is the bare name without my/the/a, e.g. 'keys', 'red backpack'; "
+                 "follow = follow a person (target = their description or empty); "
+                 "ask = any other question about what the camera sees, e.g. what kind, what color, how many, "
+                 "read this, is it ... (target empty). Request: ")
+FIND_PROMPT = ('Find "{target}" in this image. A blind person will walk to whatever you return, so only return '
+               'something that really is a {target}, not just a similar shape, color or object. Return a JSON '
+               'list of {{"label": what the object actually is, "box_2d": [ymin, xmin, ymax, xmax], '
+               '"confidence": 0.0-1.0}} with coordinates normalized to 0-1000, best match first. '
+               "If it is not clearly visible, return [] - an empty list is the right answer when unsure.")
 SCAN_PROMPT = ("List up to 8 objects in this image that a blind person might want to find later "
                "(keys, wallet, phone, glasses, cup, bottle, bag, backpack, remote, laptop, door, chair). "
                'Return a JSON list of {"label": short lowercase name, "box_2d": [ymin, xmin, ymax, xmax]} normalized to 0-1000.')
+ANSWER_PROMPT = ("You are the eyes of a blind person wearing this camera. Answer their question about what the "
+                 "camera sees in one or two short, spoken sentences. If the image doesn't show enough to tell, "
+                 "say so briefly. Question: ")
 DESCRIBE_PROMPT = ("You are the eyes of a blind person wearing this camera on their chest. In two short sentences, "
                    "say what is in front of them and where (left, right, ahead), mentioning obstacles first.")
 
@@ -236,8 +267,16 @@ def say_hint(text, every):
 
 
 # ----------------------------------------------------------------- Gemini brain
+def clean_target(target):
+    """'my dinosaur?' -> 'dinosaur', so replies read 'Your dinosaur is ...' and not 'Your my dinosaur'."""
+    t = re.sub(r"[^a-z0-9' -]", " ", (target or "").lower())
+    t = re.sub(r"^(?:(?:my|the|a|an|your|our|his|her|their|this|that|these|those|some)\s+)+", "", t.strip())
+    t = re.sub(r"(?:\s+(?:please|now|thanks|thank you|for me|go|gone|at|again|real quick|quickly|is|are))+$", "", t)
+    return " ".join(t.split())
+
+
 def simple_intent(text):
-    t = text.lower()
+    t = re.sub(r"[^a-z0-9' ]", " ", text.lower()).strip()      # drop ?!., so "my keys?" still matches
     m = re.search(r"(?:my|the|a)\s+([a-z ]+)$", t)
     target = m.group(1).strip() if m else ""
     if "stop" in t:
@@ -262,9 +301,13 @@ def fast_intent(text):
     if it["intent"] in ("stop", "walk", "describe"):
         return it
     if it["intent"] in ("find", "goto") and it["target"]:
-        return it
+        it["target"] = clean_target(it["target"])
+        if 0 < len(it["target"].split()) <= 3:          # longer = probably extra words; let Gemini parse it
+            return it
     if it["intent"] == "follow" and re.search(r"follow (me|them|him|her|us)\b", t):
         return it
+    if not it["intent"] and re.match(r"(what|which|who|how|why|is|are|does|do|can you (read|tell)|read|tell me)\b", t):
+        return {"intent": "ask", "target": ""}          # a question about the scene ("where" questions are finds)
     return None
 
 
@@ -306,36 +349,71 @@ class LocalFinder:
 class Brain:
     def __init__(self):
         self.client, self.types = None, None
-        self.no_think = True
+        self.models = [GEMINI_MODEL] + [m for m in GEMINI_FALLBACK if m != GEMINI_MODEL]   # smart tier
+        self.light = list(GEMINI_LIGHT)                                                    # light tier
+        self.think, self.model_paused = {}, {}            # per model: THINKS index it accepts, paused-until time
+        self.calls, self.paused_until, self.intents = [], 0.0, {}   # call times (last minute), 429 pause, cache
         key = os.environ.get("GEMINI_API_KEY")
         if key:
             from google import genai
             from google.genai import types
-            self.client, self.types = genai.Client(api_key=key), types
-            print("Gemini ready:", GEMINI_MODEL)
+            # no SDK retries and a short timeout: a busy model hands over to the next one instead of stalling
+            self.client = genai.Client(api_key=key, http_options=types.HttpOptions(
+                timeout=int(GEMINI_TIMEOUT_S * 1000), retry_options=types.HttpRetryOptions(attempts=1)))
+            self.types = types
+            print("Gemini ready - asks:", ", then ".join(self.models), "| background:", ", then ".join(self.light))
         else:
             print("GEMINI_API_KEY not set - finding uses the local detector only; no describe")
 
-    def _ask(self, parts, as_json=True):
+    def _ask(self, parts, as_json=True, background=False, models=None):
+        """Tries each model in `models` (default: the smart tier). background=True calls use the light tier and are
+        skipped (returns None) when over the per-minute budget or while every model is paused."""
+        models = models or (self.light if background else self.models)
+        now = time.time()
+        with GEMINI_LOCK:
+            self.calls = [t for t in self.calls if now - t < 60]
+            if background and (now < self.paused_until or len(self.calls) >= GEMINI_MAX_PER_MIN):
+                return None
+            self.calls.append(now)
         kw = dict(response_mime_type="application/json" if as_json else "text/plain", temperature=0.2)
-        if self.no_think:                                # skip Gemini's 'thinking' step: much faster
-            try:
-                kw["thinking_config"] = self.types.ThinkingConfig(thinking_budget=0)
-            except Exception:
-                self.no_think = False
-        t0 = time.time()
-        try:
-            with GEMINI_LOCK:
-                r = self.client.models.generate_content(model=GEMINI_MODEL, contents=parts,
-                                                        config=self.types.GenerateContentConfig(**kw))
-        except Exception as e:
-            if self.no_think and "think" in str(e).lower():
-                self.no_think = False                    # this model can't turn thinking off; retry normally
-                return self._ask(parts, as_json)
-            raise
-        LAST["gemini"] = time.time()
-        print(f"Gemini answered in {time.time() - t0:.1f} s")
-        return json.loads(r.text) if as_json else r.text.strip()
+        last = None
+        for model in models:
+            if time.time() < self.model_paused.get(model, 0):
+                continue                                 # busy, out of quota or unknown a moment ago
+            while True:
+                # skip Gemini's 'thinking' step (much faster). Older Flash takes a budget of 0, Gemini 3 a level;
+                # a model that rejects the setting answers with a bare 400, so we step down to the next one.
+                i = self.think.get(model, 0)
+                cfg = dict(kw, thinking_config=self.types.ThinkingConfig(**THINKS[i])) if THINKS[i] else kw
+                t0 = time.time()
+                try:
+                    with GEMINI_LOCK:
+                        r = self.client.models.generate_content(model=model, contents=parts,
+                                                                config=self.types.GenerateContentConfig(**cfg))
+                except Exception as e:
+                    last, code = e, getattr(e, "code", None)
+                    if code in (401, 403):
+                        raise                            # bad key: no model will work
+                    if code == 400 and i < len(THINKS) - 1:
+                        self.think[model] = i + 1
+                        print(f"{model} rejected the thinking setting; retrying with", THINKS[i + 1])
+                        continue
+                    busy = code in (408, 429, 500, 503, 504) or "RESOURCE_EXHAUSTED" in str(e) \
+                        or "timeout" in type(e).__name__.lower() or "timed out" in str(e).lower()
+                    daily = code == 429 and "PerDay" in str(e)   # out of today's quota: no point asking again soon
+                    self.model_paused[model] = time.time() + (3600 if daily or not busy else 60)
+                    if daily:
+                        print(f"{model} is out of today's quota - skipping it for an hour")
+                    print(f"{model} failed ({code or type(e).__name__}) after {time.time() - t0:.1f} s"
+                          + (" - trying the next model" if model != models[-1] else ""))
+                    break
+                LAST["gemini"] = time.time()
+                print(f"Gemini ({model}) answered in {time.time() - t0:.1f} s "
+                      f"({len(self.calls)} calls in the last minute)")
+                return json.loads(r.text) if as_json else r.text.strip()
+        self.paused_until = time.time() + 60             # every model failed: background calls wait a minute
+        print("No Gemini model answered - background scans paused for 60 s")
+        raise last or RuntimeError("every Gemini model is paused")
 
     def _img(self, frame):
         jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
@@ -347,18 +425,23 @@ class Brain:
             return fast
         if not self.client:
             return simple_intent(text)
+        key = text.strip().lower()
+        if key in self.intents:                          # same words as before: no need to ask again
+            return self.intents[key]
         try:
-            out = self._ask([INTENT_PROMPT + text])
+            out = self._ask([INTENT_PROMPT + text], models=self.light + self.models)   # Lite is fine at this
+            if isinstance(out, dict):
+                self.intents[key] = out
             return out if isinstance(out, dict) else simple_intent(text)
         except Exception as e:
             print("intent error:", e)
             return simple_intent(text)
 
-    def _boxes(self, frame, prompt):
+    def _boxes(self, frame, prompt, background=False):
         if not self.client or frame is None:
             return []
         try:
-            items = self._ask([self._img(frame), prompt])
+            items = self._ask([self._img(frame), prompt], background=background)
         except Exception as e:
             print("gemini error:", e)
             return []
@@ -366,13 +449,16 @@ class Brain:
         for it in items if isinstance(items, list) else []:
             try:
                 y0, x0, y1, x1 = it["box_2d"]
+                if float(it.get("confidence", 1.0)) < (GEMINI_LIGHT_FIND_CONF if background else GEMINI_FIND_CONF):
+                    print(f"Gemini unsure ({it.get('confidence')}) about {it.get('label')!r} - ignored")
+                    continue
                 out.append({"label": str(it.get("label", "")).lower(),
                             "box": [x0 * W / 1000, y0 * H / 1000, x1 * W / 1000, y1 * H / 1000]})
             except Exception:
                 continue
         return out
 
-    def find(self, frame, target, gemini_ok=True):
+    def find(self, frame, target, gemini_ok=True, background=False):
         """local find-anything detector first; Gemini only if it finds nothing."""
         items = LOCAL.detect(frame, [target]) if LOCAL is not None else []
         if items:
@@ -381,14 +467,23 @@ class Brain:
             return items
         if not gemini_ok:
             return []
-        items = self._boxes(frame, FIND_PROMPT.format(target=target))
+        items = self._boxes(frame, FIND_PROMPT.format(target=target), background)
         if items:
             with S.lock:
                 S.last_finder = "Gemini"
         return items
 
     def scan(self, frame):
-        return self._boxes(frame, SCAN_PROMPT)
+        return self._boxes(frame, SCAN_PROMPT, background=True)
+
+    def answer(self, frame, question):
+        if not self.client or frame is None:
+            return "I can't answer questions right now."
+        try:
+            return self._ask([self._img(frame), ANSWER_PROMPT + question], as_json=False)
+        except Exception as e:
+            print("answer error:", e)
+            return "I can't answer that right now."
 
     def describe(self, frame):
         if not self.client or frame is None:
@@ -767,7 +862,7 @@ def handle_command(text):
     with S.lock:
         S.last_heard = text
     it = BRAIN.intent(text)
-    intent, target = it.get("intent", ""), (it.get("target") or "").strip()
+    intent, target = it.get("intent", ""), clean_target(it.get("target"))
     print(f"COMMAND {text!r} -> {intent} {target!r}")
     if intent == "stop":
         set_mode("IDLE")
@@ -778,6 +873,9 @@ def handle_command(text):
     elif intent == "describe":
         frame, _, _ = latest()
         say(BRAIN.describe(frame))
+    elif intent == "ask":
+        frame, _, _ = latest()
+        say(BRAIN.answer(frame, text))
     elif intent == "follow":
         start_follow(target)
     elif intent in ("find", "where"):
@@ -918,7 +1016,9 @@ def refresher_loop():
             heading, _, pos = pose(meta)
             if abs(wrap(heading_to(pos, tgt["pos"])[0] - heading)) > abs(px_bearing(0, meta)):
                 continue                                           # target not in view: nothing to refresh
-        items = BRAIN.find(frame, tgt["label"], gemini_ok=time.time() - LAST["gemini"] > REFRESH_GEMINI_S)
+        # Gemini only while searching or reaching; in GOTO the map already knows where the target is
+        gemini_ok = (mode != "GOTO" or tgt.get("pos") is None) and time.time() - LAST["gemini"] > REFRESH_GEMINI_S
+        items = BRAIN.find(frame, tgt["label"], gemini_ok=gemini_ok, background=True)
         if not items:
             if mode == "SEARCH" and time.time() - tgt.get("started", time.time()) > 25:
                 say(f"I still can't find your {tgt['label']}. Stopping the search.")
@@ -945,7 +1045,7 @@ def refresher_loop():
 def memory_loop():
     """logs where notable objects are, so 'where did I leave...' works later.
     Local find-anything scan every few seconds; Gemini adds a smarter scan now and then."""
-    last_gemini = 0.0
+    last_gemini, last_thumb = 0.0, None
     while True:
         time.sleep(LOCAL_MEMORY_EVERY_S)
         if BRAIN is None:
@@ -960,9 +1060,11 @@ def memory_loop():
         items = []
         if LOCAL is not None and LOCAL.model is not None:
             items += LOCAL.detect(frame, MEMORY_CLASSES, conf=0.25)
-        if BRAIN.client is not None and time.time() - last_gemini > MEMORY_EVERY_S:
-            last_gemini = time.time()
-            items += BRAIN.scan(frame)
+        if BRAIN.client is not None and MEMORY_EVERY_S > 0 and time.time() - last_gemini > MEMORY_EVERY_S:
+            thumb = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (32, 24), interpolation=cv2.INTER_AREA)
+            if last_thumb is None or np.abs(thumb.astype(np.int16) - last_thumb).mean() > 12:
+                last_gemini, last_thumb = time.time(), thumb.astype(np.int16)   # scene changed: worth a scan
+                items += BRAIN.scan(frame)
         for it in items:
             if not it["label"]:
                 continue
