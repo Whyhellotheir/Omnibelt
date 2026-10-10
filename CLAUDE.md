@@ -148,11 +148,61 @@ Firmware safety limits:
   - Never solder or glue a motor until it has passed `TEST`.
   - GPIO14 making M2 twitch at power-on is normal.
 - **Next stages:**
-  - Stage 2: solder 40 cm leads, fit the pods, set `MOTOR_ANGLES` in the server.
+  - Stage 2: assemble the belt (below), then check `MOTOR_ANGLES` on the wearer.
+
   - Stage 4: the ring on M8, plus an optional LED with a 150 Ω resistor on ULN pin 11.
   - 3D prints are in `PRINT_THIS.zip` (15 parts, ~300 g PLA/PETG, no supports). Print one motor pod first as a fit test. To regenerate them: `cd hardware/cad && python parts.py` (needs `pip install manifold3d trimesh numpy`), which writes `stl/`.
   - Swap ring: `stl/ring_optional/ring_SWAP_plate.stl` holds all six sizes plus 3 motor capsules on one bed. The capsule slides into any ring from the fingertip side, and the wire's pull holds it in.
 
+## Belt assembly (latest plan, from the claude.ai chat, 2026-10-10)
+**Threading order.** Thread the parts onto the belt's free end in this order:
+`M3 → M4 → battery → Orin tray → hub → M5 → M6 → M7 → phone holder (M1) → M2`
+- Motor pockets face the body; wire grooves go on the top edge.
+- The buckle sits between M2 and M3, halfway between the navel and the right hip.
+
+**Placement.** Positions are measured from the buckle as a % of the waist W.
+
+| Part | % of W | cm at W = 90 | Angle (+ = wearer's right) |
+|---|---|---|---|
+| M3 | 6% | 6 | 90 (right hip) |
+| M4 | 15% | 13 | 122 |
+| Battery | 23% → **see the overlap fix** | 21 → **~19.5** | |
+| Orin tray | 31% | 28 | 180 (spine) |
+| Hub | 40% | 36 | |
+| M5 | 48% | 43 | −119 |
+| M6 | 56% | 51 | −90 (left hip) |
+| M7 | 69% | 62 | −43 |
+| M1 + phone holder | 81% | 73 | 0 (navel) |
+| M2 | 94% | 84 | 47 |
+
+- These angles match `MOTOR_ANGLES` in the server to within 3°, so no code change is needed. Re-measure them on the wearer anyway.
+- **Overlap fix (checked against the CAD widths):**
+  - Widths along the belt: Orin tray 8.1 cm, hub 6.0, battery cradle 8.2, pods 2.6, iPhone belt cradle 15.3.
+  - At the table's % spacing, the battery and Orin overlap on every waist under about 110 cm (−0.9 cm at W = 90).
+  - On waists under about 80 cm, the Orin and hub collide too.
+  - **Rule:** butt the battery, Orin tray and hub up against each other, with the Orin centred on the spine. Place only the motors and phone by %. The battery then sits at about 19.5 cm on a 90 cm waist.
+  - If M4 or M5 has to move more than 2–3 cm because of this, update `MOTOR_ANGLES`.
+- **Fine-tune on the wearer:** M1 on the navel, M3 and M6 on the hip bones, the Orin at the spine. Then mark both edges of every part and add stops: tape, or a hot-glue bead on the webbing.
+
+**Wiring: 16 pieces, about 7 m at W = 90.** Every motor has exactly two connections: its own signal wire, and the shared red 5V chain. There are no ground wires to the motors, because the ULN2803 switches the low side.
+
+| What | Pieces | Route | Cut length |
+|---|---|---|---|
+| Signal wires | 7 | hub → each pod, along the belt | measured + 20 cm |
+| Red 5V chain, left | 5 | hub → M5 → M6 → M7 → M1 → M2 | pod-to-pod + 10 cm |
+| Red 5V chain, right | 2 | hub → M4 → M3 | pod-to-pod + 10 cm |
+| Ring lead | 2 | hub → up the arm (signal + red) | ~110 cm each |
+
+- The chain never crosses the buckle, so the belt still opens.
+- At each pod, splice three reds: the incoming chain piece, the outgoing chain piece and the motor's red lead. The motor's other lead goes to its signal wire. Hot-glue or heat-shrink every joint and flag both ends of every piece (M1–M7, R1–R7).
+- Current is at most 3 motors × ~0.1 A (the firmware caps it), which 22 AWG handles easily.
+- **Extra length for other wearers:** add 10 cm to every piece and coil the extra in that pod's slack loop. That covers a waist about 15 cm bigger without re-cutting.
+
+**Fit fixes**
+- **Orin tray too tight:** sand the inside of the two side walls, focusing on the bottom edge (first-layer squish). The design clearance is 0.8 mm per side. If it's off by more than 2 mm, cut the side walls off; the velcro does the holding. To reprint instead, measure the binding width and raise `ORIN_L`/`ORIN_W` in `hardware/cad/parts.py`.
+- **Holding the Orin:** two velcro straps through the tray notches, over the board's ends (port block and 40-pin header, not the fan).
+- **Holding the ESP32:** it's pressed into the breadboard; the breadboard's sticky back (plus double-sided tape or hot glue) holds it in the hub; the lid presses on. Zip-tie the USB cable to the hub so a tug can't pull the ESP32 out.
+- **Battery:** the cradle was sized for the INIU *Slim* (69 × 99 × 15 mm) and doesn't fit our bank. Skip the cradle and strap the bank straight to the belt with two velcro strips, one near each end. Keep its ports reachable. Avoid electrical tape. For a custom cradle, measure the bank (L × W × T mm) and change `BATT_SPAN` and the cradle dimensions in `parts.py`.
 ## Checkpoints
 1. Wave a hand at the phone and the right motor buzzes.
 2. Blindfolded hallway walk with no collisions: (a) on wall power, (b) on battery and Wi-Fi.
@@ -176,3 +226,4 @@ After checkpoint 3: freeze, rehearse the 90 s demo five times, and record a back
 - 2026-10-10: Build Guide v2: YOLO-World find-anything runs locally on the Nano with Gemini as the fallback (server + `vision/tests/find_test.py`). Took the newer `belt_test.py` (Windows COM port, no reset on open) and `parts.py` (universal belt phone holder) from `navbelt_code (1).zip`.
 - 2026-10-10: navbelt_code (2): floor map + A* path planning on the Orin, `tracking` flag from the phone, swap ring CAD. Fixed `parts.py` crashing at export (an ordering bug since the universal holder; all 24 STLs now export watertight). Fixed the obstacle height/distance math (the chest mount missed a 0.35 m backpack; synthetic checks in commit 3fcbcae).
 - 2026-10-10: Phone moves to the belt (front, navel). `CAM_HEIGHT_M` default changed 1.3 → 1.0; print the belt cradle, not the chest one.
+- 2026-10-10: Added the belt assembly plan from the claude.ai chat (order, % spacing, 16-piece wiring, fit fixes). The CAD-width check found the battery and Orin overlap under ~110 cm waist; rule: butt battery/Orin/hub together on the spine.
