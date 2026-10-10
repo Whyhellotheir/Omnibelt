@@ -3,7 +3,7 @@
     export ELEVENLABS_API_KEY=...
     python elevenlabs_test.py --voices                  # list voice IDs, pick one
     python elevenlabs_test.py VOICE_ID "Your keys are ahead, slightly left"
-Saves say.mp3 (open it to listen)."""
+Saves desk.mp3 (open it to listen)."""
 import os, sys, time
 import requests
 
@@ -20,4 +20,4 @@ r = requests.post(f"https://api.elevenlabs.io/v1/text-to-speech/{voice}?output_f
                   json={"text": text, "model_id": "eleven_flash_v2_5"})
 r.raise_for_status()
 open("say.mp3", "wb").write(r.content)
-print(f"{time.time() - t0:.2f} s, {len(r.content)} bytes -> say.mp3")
+print(f"{time.time() - t0:.2f} s, {len(r.content)} bytes -> desk.mp3")
