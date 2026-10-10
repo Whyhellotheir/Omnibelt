@@ -412,11 +412,13 @@ def obstacle_columns(depth, dets, meta):
         _, fy, _, cy = cam(meta)
         pitch = pose(meta)[1]
         rows = np.arange(0, H, 4)
-        elev = np.radians(pitch + np.degrees(np.arctan2(cy - rows, fy)))         # angle above horizontal, per row
+        p = math.radians(pitch)
+        up = math.sin(p) + (cy - rows) / fy * math.cos(p)    # height gained per metre of camera depth, per row (exact pinhole)
         d = depth[rows][:, :N_COLS * (W // N_COLS)].reshape(len(rows), N_COLS, W // N_COLS).min(axis=2)
-        height = CAM_HEIGHT_M + d * np.tan(elev)[:, None]
+        height = CAM_HEIGHT_M + d * up[:, None]
         ok = (height > OBST_MIN_H) & (height < OBST_MAX_H) & (d > 0.2)
-        dd = np.where(ok, d, 9.9)
+        ahead = d * (math.cos(p) - (cy - rows) / fy * math.sin(p))[:, None]   # level distance along the floor
+        dd = np.where(ok, ahead, 9.9)
         cols = np.percentile(dd, 5, axis=0).astype(np.float32)
     else:
         for det in dets:
