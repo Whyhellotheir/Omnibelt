@@ -25,6 +25,7 @@ final class VoiceIO: NSObject, ObservableObject {
     private var replyTimer: Timer?
     private var replyExtended = false
     private var wakeChimed = false
+    private var stopSent = false
 
     private var player: AVAudioPlayer?
     private let synth = AVSpeechSynthesizer()
@@ -72,6 +73,7 @@ final class VoiceIO: NSObject, ObservableObject {
         req.contextualStrings = Config.speechHints          // bias recognition toward our words
         if Config.onDeviceSpeech, recognizer.supportsOnDeviceRecognition { req.requiresOnDeviceRecognition = true }
         wakeChimed = false
+        stopSent = false
         request = req
         let input = engine.inputNode
         input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { [weak self] buffer, _ in
@@ -86,6 +88,13 @@ final class VoiceIO: NSObject, ObservableObject {
                 if let result = result {
                     let text = result.bestTranscription.formattedString.lowercased()
                     self.lastHeard = text
+                    // "stop" acts at once, wake word or not: cut our speech and tell the Orin (once per utterance)
+                    if !self.stopSent && Self.isStop(text) {
+                        self.stopSent = true
+                        self.hush()
+                        self.streamer?.sendCommand("stop")
+                        self.lastHeard = "■ stop"
+                    }
                     // Speech that starts inside the reply window keeps it open until the utterance finishes.
                     // At most one extension per window, so ambient chatter can't hold it open forever.
                     if let until = self.replyUntil, Date() < until, !self.replyExtended {
@@ -137,8 +146,26 @@ final class VoiceIO: NSObject, ObservableObject {
         return Config.completeEndings.contains { t.hasSuffix($0) } ? 0.7 : 1.6
     }
 
+    /// "stop", "stop stop", "belt stop": short utterances ending in stop.
+    static func isStop(_ text: String) -> Bool {
+        let words = text.lowercased().components(separatedBy: CharacterSet.letters.inverted).filter { !$0.isEmpty }
+        return words.last == "stop" && words.count <= 3
+    }
+
+    /// Cut whatever we're saying right now (user said stop, or the Orin sent "hush").
+    func hush() {
+        player?.stop()
+        if synth.isSpeaking { synth.stopSpeaking(at: .immediate) }
+        replyTimer?.invalidate()
+        replyUntil = nil
+    }
+
     private func finish(_ text: String) {
         let trimmed = text.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+        if stopSent && Self.isStop(trimmed) {            // already handled the moment it was heard
+            listen()
+            return
+        }
         // our own voice saying "...follow the belt" must not trigger a command; "stop" always gets through
         if (player?.isPlaying == true || synth.isSpeaking) && !trimmed.contains("stop") {
             listen()

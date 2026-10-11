@@ -305,6 +305,8 @@ final class BeltStreamer: NSObject, ObservableObject, ARSessionDelegate {
                         self.updateCameraMode(forSpokenText: say)
                         let promptedText = self.actionPrompt(for: say)
                         DispatchQueue.main.async { self.voice?.say(promptedText) }
+                    } else if type == "hush" {
+                        DispatchQueue.main.async { self.voice?.hush() }
                     } else if type == "camera_mode" {
                         if let zoom = obj["zoom"] as? String, let p = CameraProfile(rawValue: zoom) {
                             self.setProfile(p)

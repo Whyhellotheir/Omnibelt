@@ -75,3 +75,8 @@ A segmented "Camera" picker (Auto / 1x / 0.75x / 0.5x) and an "ARKit video forma
 - **No self-triggers:** anything heard while the phone is speaking is ignored, unless it contains "stop". The belt's own "Follow the belt." can't fire a command.
 - **Compile notes:** this adds `import AudioToolbox` (for `AudioServicesPlaySystemSound`). No other new APIs.
 - **Test:** say "Belt, find my wallet" in a noisy room. You should hear the click, and the dashboard transcript should show "find my wallet".
+
+## Wave 6: stop + long range (rebuild needed)
+- **"Stop" works with no wake word.** A short utterance ending in "stop" ("stop", "stop stop", "belt stop") cuts the current speech at once (`hush()`), and is sent to the Orin the moment it's heard, not after the silence wait.
+- **Orin `{"type":"hush"}`** (sent whenever it stops) also cuts the phone's speech.
+- **Frames are now 960x720** (`Config.frameWidth/Height`), for more detail on far objects; the Orin zooms into crops of them. If the stream gets laggy on the hotspot, set it back to 640x480.

@@ -8,8 +8,8 @@ enum Config {
     static let port = 8765
     static let fps: Double = 15
     /// Landscape (pre-rotation) size of the sent image. Portrait frames are sent as frameHeight x frameWidth.
-    static let frameWidth = 640
-    static let frameHeight = 480
+    static let frameWidth = 960                         // more detail for far objects (Orin zooms into crops of it)
+    static let frameHeight = 720
     static let jpegQuality: CGFloat = 0.75
     static let wakeWord = "belt"                        // "Belt, find my keys" (short real word = recognized reliably)
     /// Any of these starts a command; the longest/latest match wins ("omnibelt" still works).

@@ -91,7 +91,7 @@ BODY_RADIUS_M = 0.35       # keep the route this far from obstacles
 LOOKAHEAD_M = 0.8          # steer toward the point this far along the route
 OBST_MIN_H, OBST_MAX_H = 0.15, 1.9   # only things between ankle and head height count as obstacles
 RING = 8
-VERSION = "nav-accuracy w5"
+VERSION = "nav-accuracy w6"
 FIELD = {"mirror_belt": False, "mirror_hands": False, "voice": "quiet"}   # dashboard switches
 ORIENT = {"force": os.environ.get("ORIENT", "auto"), "k": 0}   # auto | portrait | landscape; k = current rotation
 W, H = 640, 480
@@ -620,16 +620,17 @@ def start_seat():
 
 
 def tile_detect(frame):
-    """2x zoom on the lower two thirds (where table and floor items are): two overlapping tiles, boxes mapped back."""
+    """look again, zoomed in: the two lower corners (table/floor items) and the horizon band (far items). The
+    detector scales each crop up to its input size, so a crop of the full-resolution frame gains real detail."""
     h, w = frame.shape[:2]
     th, tw = int(h * 2 / 3), int(w * 0.55)
+    crops = [(0, h - th, tw, th), (w - tw, h - th, tw, th),                      # lower left / lower right
+             (int(w * 0.2), int(h * 0.28), int(w * 0.6), int(h * 0.45))]         # middle band: far away
     out = []
-    for x0 in (0, w - tw):
-        y0 = h - th
-        tile = cv2.resize(frame[y0:h, x0:x0 + tw], (tw * 2, th * 2), interpolation=cv2.INTER_LINEAR)
-        for d in DET.det.detect(tile):
+    for x0, y0, cw, ch in crops:
+        for d in DET.det.detect(np.ascontiguousarray(frame[y0:y0 + ch, x0:x0 + cw])):
             b = d["box"]
-            out.append(dict(d, box=[b[0] / 2 + x0, b[1] / 2 + y0, b[2] / 2 + x0, b[3] / 2 + y0]))
+            out.append(dict(d, box=[b[0] + x0, b[1] + y0, b[2] + x0, b[3] + y0]))
     return out
 
 
@@ -1024,8 +1025,21 @@ def lock_target(label, box, meta, depth, walk_only=False):
             "box_t": time.time(), "in_view": True, "walk_only": walk_only}
 
 
+def smooth_pos(tgt, new):
+    """blend the last few position estimates (closer sightings count more, outliers >1 m dropped), so a far
+    target doesn't jump around and the belt points steadily."""
+    hist = (tgt.get("hist") or [])[-4:] + [(np.asarray(new["pos"], float), float(new.get("dist") or 1.5))]
+    P = np.array([q for q, _ in hist])
+    w = np.array([1.0 / max(d, 0.5) ** 2 for _, d in hist])
+    keep = np.hypot(*(P - np.median(P, axis=0)).T) < 1.0
+    if keep.any():
+        new["pos"] = (P[keep] * w[keep, None]).sum(axis=0) / w[keep].sum()
+    new["hist"] = hist
+    return new
+
+
 def start_reach(tgt):
-    LAST["inside_since"] = 0.0
+    LAST["inside_since"], LAST["reach_t"] = 0.0, time.time()
     BELT.set({})
     set_mode("REACH", tgt)
     say("It's right in front of you. Reach out, and the ring will guide your hand.")
@@ -1260,6 +1274,7 @@ def handle_command(text):
     print(f"COMMAND {text!r} -> {intent} {target!r}")
     if intent == "stop":
         set_mode("IDLE")
+        send_phone({"type": "hush"})                     # cut whatever the phone is saying
         say("Stopped.")
     elif intent == "walk":
         set_mode("WALK")
@@ -1320,7 +1335,7 @@ def reach_step(meta, tgt, hands):
         say_hint("Reach toward it. I can't see your hand yet.", 4)
         return
     hx, hy = hand
-    pad = 20
+    pad = max(25.0, 0.25 * max(bx1 - bx0, by1 - by0))   # a little forgiving: fingertips at the item's edge count
     if bx0 - pad <= hx <= bx1 + pad and by0 - pad <= hy <= by1 + pad:
         BELT.set({RING: (100, 0)})
         if LAST["inside_since"] == 0:
@@ -1358,6 +1373,10 @@ def control_loop():
                 set_mode("GOTO", tgt)                     # lost it and walked away: back to the belt
                 say("Let's get a little closer. Follow the belt.")
                 continue
+            if time.time() - LAST.get("reach_t", time.time()) > 25:
+                set_mode("IDLE")                          # don't buzz forever
+                say("Stopping. Say find again if you need it.")
+                continue
             reach_step(meta, tgt, meta.get("hands", []))
             continue
         goal, gdist = 0.0, None
@@ -1386,6 +1405,14 @@ def control_loop():
             say(f"You're at the {tgt['label']}.")
             set_mode("IDLE")
             continue
+        if mode == "GOTO" and gdist is not None and not tgt.get("walk_only") and tgt.get("box") is None:
+            LAST["near_since"] = (LAST.get("near_since") or time.time()) if gdist < 0.6 else 0
+            if LAST["near_since"] and time.time() - LAST["near_since"] > 3:     # remembered spot reached, item unseen
+                LAST["near_since"] = 0
+                BELT.pattern("ARRIVE")
+                set_mode("IDLE")
+                say(f"You're there. Your {tgt['label']} should be right in front of you.")
+                continue
         if mode == "GOTO" and gdist is not None and not tgt.get("walk_only"):
             now = time.time()
             gd = gdist if tgt.get("dist_source") != "floor-guess" else None   # table items: trust only the box size
@@ -1464,7 +1491,7 @@ def refresher_loop():
                 say(f"Found an empty {seats[0]['name']}, {direction_words(wrap(heading_to(pos, new['pos'])[0] - heading))}. Follow the belt.")
             elif still:
                 with S.lock:
-                    tgt.update(new)
+                    tgt.update(smooth_pos(tgt, new))
             continue
         # Gemini only while searching or reaching; in GOTO the map already knows where the target is
         gemini_ok = (mode != "GOTO" or tgt.get("pos") is None) and time.time() - LAST["gemini"] > REFRESH_GEMINI_S
@@ -1501,7 +1528,7 @@ def refresher_loop():
                     tgt[k] = new[k]
         else:
             with S.lock:
-                tgt.update(new)
+                tgt.update(smooth_pos(tgt, new))
 
 
 def memory_loop():
