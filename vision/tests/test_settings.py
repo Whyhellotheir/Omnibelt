@@ -28,7 +28,7 @@ s = settings.Settings(conf_path="/nonexistent/nvpmodel.conf")
 ok, msg = s.set("power", "15W")
 assert not ok and "dry-run" in msg, msg
 g = s.get()
-assert g["dry_run"] and g["power_modes"] == [] and g["camera"] == "auto" and "auto" in g["options"]["camera"] and g["planner"] is True
+assert g["dry_run"] and g["power_modes"] == [] and g["camera"] == "0.75x" and "auto" in g["options"]["camera"] and g["planner"] is True
 print("OK dry-run:", msg)
 
 # validation and on_change

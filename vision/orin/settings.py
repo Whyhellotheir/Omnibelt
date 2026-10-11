@@ -57,7 +57,8 @@ class Settings:
     def __init__(self, on_change=None, conf_path=NVP_CONF):
         self.lock = threading.Lock()
         self.on_change = on_change
-        self.values = {"camera": "auto", "planner": True, "orient": "auto", "power": None}
+        self.values = {"camera": "0.75x", "planner": True, "orient": "auto", "power": None,
+                       "mirror_belt": False, "mirror_hands": False, "voice": "quiet"}
         self.modes = {}
         self.dry_run = True
         try:
@@ -86,6 +87,7 @@ class Settings:
             d["power_modes"] = list(self.modes)
             d["dry_run"] = self.dry_run
             d["options"] = {"camera": list(CAMERAS), "orient": list(ORIENTS), "planner": [True, False],
+                            "mirror_belt": [False, True], "mirror_hands": [False, True], "voice": ["quiet", "normal"],
                             "power": list(self.modes)}
             return d
 
@@ -96,11 +98,14 @@ class Settings:
         elif key == "orient":
             if value not in ORIENTS:
                 return False, f"orientation must be one of {', '.join(ORIENTS)}"
-        elif key == "planner":
+        elif key in ("planner", "mirror_belt", "mirror_hands"):
             if isinstance(value, str) and value.lower() in ("on", "off", "true", "false"):
                 value = value.lower() in ("on", "true")
             if not isinstance(value, bool):
-                return False, "planner must be on or off"
+                return False, f"{key} must be on or off"
+        elif key == "voice":
+            if value not in ("quiet", "normal"):
+                return False, "voice must be quiet or normal"
         elif key == "power":
             return self._set_power(value)
         else:

@@ -91,7 +91,8 @@ BODY_RADIUS_M = 0.35       # keep the route this far from obstacles
 LOOKAHEAD_M = 0.8          # steer toward the point this far along the route
 OBST_MIN_H, OBST_MAX_H = 0.15, 1.9   # only things between ankle and head height count as obstacles
 RING = 8
-VERSION = "nav-accuracy w3"
+VERSION = "nav-accuracy w5"
+FIELD = {"mirror_belt": False, "mirror_hands": False, "voice": "quiet"}   # dashboard switches
 ORIENT = {"force": os.environ.get("ORIENT", "auto"), "k": 0}   # auto | portrait | landscape; k = current rotation
 W, H = 640, 480
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
@@ -299,7 +300,7 @@ class Belt:
 
 
 def motors_for(angle, duty, hz):
-    a = wrap(angle)
+    a = wrap(-angle if FIELD["mirror_belt"] else angle)
     if abs(a) > 150:
         return {4: (duty, hz), 5: (duty, hz)}
     m = min(MOTOR_ANGLES, key=lambda k: abs(wrap(MOTOR_ANGLES[k] - a)))
@@ -322,8 +323,10 @@ def send_phone(obj):
 
 
 def say_hint(text, every):
-    if time.time() - LAST["hint"] > every:
-        LAST["hint"] = time.time()
+    quiet = FIELD["voice"] == "quiet"
+    gap = every * (3.0 if quiet and text == LAST.get("hint_text") else 1.6 if quiet else 1.0)
+    if time.time() - LAST["hint"] > gap:
+        LAST["hint"], LAST["hint_text"] = time.time(), text
         say(text)
 
 
@@ -331,7 +334,8 @@ def say_hint(text, every):
 def clean_target(target):
     """'my dinosaur?' -> 'dinosaur', so replies read 'Your dinosaur is ...' and not 'Your my dinosaur'."""
     t = re.sub(r"[^a-z0-9' -]", " ", (target or "").lower())
-    t = re.sub(r"^(?:(?:my|the|a|an|your|our|his|her|their|this|that|these|those|some)\s+)+", "", t.strip())
+    t = re.sub(r"^(?:(?:my|the|a|an|your|our|his|her|their|this|that|these|those|some|nearest|closest|"
+               r"near|nearby)\s+)+", "", t.strip())
     t = re.sub(r"(?:\s+(?:please|now|thanks|thank you|for me|go|gone|at|again|real quick|quickly|is|are))+$", "", t)
     return " ".join(t.split())
 
@@ -498,11 +502,11 @@ class Brain:
             print("intent error:", e)
             return simple_intent(text)
 
-    def _boxes(self, frame, prompt, background=False):
+    def _boxes(self, frame, prompt, background=False, models=None):
         if not self.client or frame is None:
             return []
         try:
-            items = self._ask([self._img(frame), prompt], background=background)
+            items = self._ask([self._img(frame), prompt], background=background, models=models)
         except Exception as e:
             print("gemini error:", e)
             return []
@@ -539,22 +543,80 @@ class Brain:
         return self._boxes(frame, SCAN_PROMPT, background=True)
 
     def answer(self, frame, question):
-        if not self.client or frame is None:
-            return "I can't answer questions right now."
-        try:
-            return self._ask([self._img(frame), ANSWER_PROMPT + question], as_json=False)
-        except Exception as e:
-            print("answer error:", e)
-            return "I can't answer that right now."
+        if self.client and frame is not None:
+            try:
+                return self._ask([self._img(frame), ANSWER_PROMPT + question], as_json=False,
+                                 models=self.models + self.light)      # Lite has a far bigger daily quota
+            except Exception as e:
+                print("answer error:", e)
+        return local_scene()
 
     def describe(self, frame):
-        if not self.client or frame is None:
-            return "I can't describe the scene right now."
-        try:
-            return self._ask([self._img(frame), DESCRIBE_PROMPT], as_json=False)
-        except Exception as e:
-            print("describe error:", e)
-            return "I can't describe the scene right now."
+        if self.client and frame is not None:
+            try:
+                return self._ask([self._img(frame), DESCRIBE_PROMPT], as_json=False, models=self.models + self.light)
+            except Exception as e:
+                print("describe error:", e)
+        return local_scene()
+
+
+def local_scene():
+    """offline answer from what the detectors see right now: 'I see a chair ahead and your keys slightly left.'"""
+    with S.lock:
+        dets, meta = list(S.dets), S.meta
+    items = [(d["name"], d["box"]) for d in dets if d.get("conf", 1) > 0.4]
+    if DET is not None:
+        vd = DET.latest()[0]
+        items += [(d["label"], d["box"]) for d in vd if d["label"] in finder.MEMORY_LABELS and d.get("conf", 0) > 0.25]
+    if not items or meta is None:
+        return "I don't see anything I recognize right now."
+    seen, parts = set(), []
+    for name, b in sorted(items, key=lambda it: -(it[1][3] - it[1][1])):        # biggest (nearest) first
+        if name in seen or len(parts) >= 4:
+            continue
+        seen.add(name)
+        rel = px_bearing((b[0] + b[2]) / 2, meta)
+        where = "ahead" if abs(rel) < 12 else ("slightly " if abs(rel) < 30 else "to your ") + ("right" if rel > 0 else "left")
+        parts.append(f"{'your ' if name in finder.DEMO else 'a '}{name} {where}")
+    return "I see " + (", ".join(parts[:-1]) + " and " + parts[-1] if len(parts) > 1 else parts[0]) + "."
+
+
+SEAT_CLASSES = ("chair", "couch", "bench")
+
+
+def empty_seats(dets):
+    """chairs/couches/benches with nobody sitting on them (no person box over the seat's middle)."""
+    people = [d["box"] for d in dets if d["name"] == "person"]
+    out = []
+    for d in dets:
+        if d["name"] not in SEAT_CLASSES:
+            continue
+        x0, y0, x1, y1 = d["box"]
+        cx, cy = (x0 + x1) / 2, y0 + 0.6 * (y1 - y0)
+        taken = any(p[0] <= cx <= p[2] and p[1] <= cy <= p[3] + 0.1 * (p[3] - p[1]) for p in people)
+        if not taken:
+            out.append(d)
+    return sorted(out, key=lambda d: -d["box"][3])                              # nearest (lowest in frame) first
+
+
+def start_seat():
+    frame, meta, depth = latest()
+    if frame is None:
+        say("I'm not getting any video yet.")
+        return
+    with S.lock:
+        dets = list(S.dets)
+    seats = empty_seats(dets)
+    if not seats:
+        set_mode("SEARCH", {"label": "empty seat", "kind": "seat", "pos": None, "box": None, "in_view": False,
+                            "walk_only": True, "started": time.time()})
+        say("I don't see an empty seat yet. Turn slowly and I'll keep looking.")
+        return
+    tgt = dict(lock_target("empty seat", seats[0]["box"], meta, depth, walk_only=True), kind="seat")
+    heading, _, pos = pose(meta)
+    set_mode("GOTO", tgt)
+    say(f"There's an empty {seats[0]['name']} {direction_words(wrap(heading_to(pos, tgt['pos'])[0] - heading))}, "
+        f"about {max(1, round(tgt['dist']))} meters away. Follow the belt.")
 
 
 def tile_detect(frame):
@@ -571,6 +633,21 @@ def tile_detect(frame):
     return out
 
 
+EXIT_WORDS = ("exit", "exit door", "way out", "emergency exit", "the exit")
+WHERE_CLAUSE = re.compile(r"\s+(?:on|in|at|near|by|under|next to|beside|behind|inside|over|from)\s+(?:the|a|my|this|that)?\s*\S.*$")
+
+
+def open_queries(target):
+    """words to try with the open-vocabulary detector, most specific first."""
+    if target in EXIT_WORDS:
+        return ["exit sign", "exit door"]
+    core = WHERE_CLAUSE.sub("", target).strip() or target           # "green dragon on the desk" -> "green dragon"
+    qs = [core]
+    if len(core.split()) > 1:
+        qs.append(core.split()[-1])                                   # ...then just "dragon"
+    return qs
+
+
 def local_find(frame, target, after_t=None, zoom=False):
     """fixed-vocabulary detector thread (distractor-aware, taught items re-ranked); open-vocab for other words."""
     if DET is None:
@@ -585,13 +662,26 @@ def local_find(frame, target, after_t=None, zoom=False):
             best = finder.pick_target(tile_detect(fr), target, TEACH, fr)   # small item: look again, zoomed in
             if best is not None:
                 best = dict(best, zoomed=True)
+        if best is not None and finder.canonical(target) == "door":
+            doors = [d for d in dets if d["label"] == "door"]
+            best = max(doors, key=lambda d: (d["box"][2] - d["box"][0]) * (d["box"][3] - d["box"][1]), default=best)
         return [dict(best, meta=meta, label=target)] if best else []
-    try:
-        found = DET.det.detect_open(frame, target)
-    except Exception as e:
-        print("open-vocab error:", e)
-        return []
-    return sorted(found, key=lambda d: -d["conf"])[:1]
+    found = []
+    for q in open_queries(target):                       # most specific first, then the plain noun
+        try:
+            found = DET.det.detect_open(fr, q)
+        except Exception as e:
+            print("open-vocab error:", e)
+            return []
+        if found:
+            break
+    if not found and target in EXIT_WORDS:               # no exit sign in view: the nearest door will do
+        found = [d for d in dets if d["label"] == "door"]
+    if target in EXIT_WORDS or target == "door":        # "nearest": biggest box = closest
+        found = sorted(found, key=lambda d: -(d["box"][2] - d["box"][0]) * (d["box"][3] - d["box"][1]))
+    else:
+        found = sorted(found, key=lambda d: -d["conf"])
+    return [dict(found[0], meta=meta, label=target)] if found else []
 
 
 def confirmed_find(frame, target, budget_s=0.8):
@@ -852,7 +942,7 @@ def perception_loop():
             worker.submit(frame, meta, fid)             # never blocks; the worker keeps only the newest frame
         if DET is not None:
             DET.submit(frame, meta, fid)                # fixed-vocab YOLO-World, ~8 Hz, own thread
-        res = model.track(frame, persist=True, verbose=False)[0]
+        res = model.track(frame, persist=True, verbose=False, tracker="bytetrack.yaml")[0]
         dets = []
         if res.boxes is not None and len(res.boxes):
             ids = res.boxes.id.int().tolist() if res.boxes.id is not None else [None] * len(res.boxes)
@@ -952,10 +1042,13 @@ def start_find(target, walk_only=False, ask_first=False):
     else:
         items = confirmed_find(frame, target)
         if not items and BRAIN.client is not None:
-            items = BRAIN._boxes(frame, FIND_PROMPT.format(target=target))
+            items = BRAIN._boxes(frame, FIND_PROMPT.format(target=target), models=BRAIN.models + BRAIN.light)
     if items:
         meta = items[0].get("meta") or meta
         tgt = lock_target(target, items[0]["box"], meta, depth, walk_only)
+        if not walk_only and tracking_ok(meta):
+            for _ in range(2):
+                MEM.add(target, tgt["pos"], tgt.get("height"), items[0].get("conf", 0.5), cam_pos_xz=pose(meta)[2])
         rel = wrap(heading_to(pose(meta)[2], tgt["pos"])[0] - pose(meta)[0])
         if tgt["dist"] < REACH_GATE.reach_m and tgt.get("dist_source") != "floor-guess" and not walk_only:
             start_reach(tgt)
@@ -1094,6 +1187,26 @@ def fix_words(text):
 REACH_RE = re.compile(r"^\W*(?:reach|reach mode|i'?m here|i am here|it'?s (?:close|here|right here)|grab it|i'?m close)\b")
 
 
+SEAT_RE = re.compile(r"\b(seat|somewhere to sit|place to sit|empty chair|where can i sit|sit down)\b")
+
+
+def mentioned_item(t):
+    """an item the user cares about, named anywhere in the sentence (vocabulary or something remembered)."""
+    words = re.sub(r"[^a-z ]", " ", t).split()
+    for n in (3, 2, 1):
+        for i in range(len(words) - n + 1):
+            phrase = " ".join(words[i:i + n])
+            if words[i] in ("my", "the", "a", "it", "is", "see", "you", "do", "can", "any"):
+                continue                                 # phrases must start on a content word
+            lab = finder.canonical(phrase)
+            if lab in finder.MEMORY_LABELS:
+                return lab
+            hit = MEM.recall(phrase) if len(phrase) > 3 else None
+            if hit:
+                return hit["label"]
+    return None
+
+
 def handle_command(text):
     text = fix_words(text)
     with S.lock:
@@ -1135,8 +1248,15 @@ def handle_command(text):
         lab = clean_target(m.group(1))
         say(f"Okay, I forgot what your {lab} looks like." if TEACH.forget(lab) else f"I hadn't learned your {lab}.")
         return
+    if SEAT_RE.search(t):
+        start_seat()
+        return
     it = BRAIN.intent(text)
     intent, target = it.get("intent", ""), clean_target(it.get("target"))
+    if intent in ("", "ask", "describe"):                 # "do you see my wallet", "is my bottle around"
+        item = mentioned_item(t)
+        if item:
+            intent, target = "find", item
     print(f"COMMAND {text!r} -> {intent} {target!r}")
     if intent == "stop":
         set_mode("IDLE")
@@ -1153,15 +1273,26 @@ def handle_command(text):
     elif intent == "follow":
         start_follow(target)
     elif intent in ("find", "where"):
+        target = WHERE_CLAUSE.sub("", target).strip() or target    # "green dragon on the desk" -> "green dragon"
+        if target in EXIT_WORDS or finder.canonical(target) == "door":
+            start_find(target, walk_only=True)                     # places: walk there, no reach
+            return
         start_find(target or "keys", ask_first=intent == "where" or bool(WHERE_RE.search(t)))
     elif intent == "goto":
         start_find(target or "door", walk_only=True)
     else:
-        say("Sorry, I didn't catch that.")
+        say("Sorry, I didn't catch that. Try: find my keys.")
 
 
 # ----------------------------------------------------------------- control loop (10 Hz)
 def pick_hand(hands):
+    best = pick_hand_raw(hands)
+    if best is not None and FIELD["mirror_hands"]:
+        best = [W - best[0], best[1]]
+    return best
+
+
+def pick_hand_raw(hands):
     best = None
     for h in hands or []:
         pt = h.get("index") or h.get("wrist")
@@ -1312,6 +1443,29 @@ def refresher_loop():
             heading, _, pos = pose(meta)
             if abs(wrap(heading_to(pos, tgt["pos"])[0] - heading)) > abs(px_bearing(0, meta)):
                 continue                                           # target not in view: nothing to refresh
+        if tgt.get("kind") == "seat":                   # "find me a seat": re-find an empty chair, not a word
+            with S.lock:
+                seats = empty_seats(list(S.dets))
+            if not seats:
+                if mode == "SEARCH" and time.time() - tgt.get("started", time.time()) > 25:
+                    say("I still can't find an empty seat. Stopping the search.")
+                    set_mode("IDLE")
+                continue
+            if tgt.get("pos") is not None:
+                hd, _, ps = pose(meta)
+                want = wrap(heading_to(ps, tgt["pos"])[0] - hd)
+                seats.sort(key=lambda d: abs(px_bearing((d["box"][0] + d["box"][2]) / 2, meta) - want))
+            new = dict(lock_target("empty seat", seats[0]["box"], meta, depth, True), kind="seat")
+            with S.lock:
+                still = S.mode == mode and S.target is tgt
+            if still and mode == "SEARCH":
+                heading, _, pos = pose(meta)
+                set_mode("GOTO", new)
+                say(f"Found an empty {seats[0]['name']}, {direction_words(wrap(heading_to(pos, new['pos'])[0] - heading))}. Follow the belt.")
+            elif still:
+                with S.lock:
+                    tgt.update(new)
+            continue
         # Gemini only while searching or reaching; in GOTO the map already knows where the target is
         gemini_ok = (mode != "GOTO" or tgt.get("pos") is None) and time.time() - LAST["gemini"] > REFRESH_GEMINI_S
         items = BRAIN.find(frame, tgt["label"], gemini_ok=gemini_ok, background=True)
@@ -1335,6 +1489,8 @@ def refresher_loop():
             still = S.mode == mode and S.target is tgt
         if not still:
             continue
+        if not tgt.get("walk_only") and tracking_ok(meta):                 # keep memory current while guiding
+            MEM.add(tgt["label"], new["pos"], new.get("height"), items[0].get("conf", 0.5), cam_pos_xz=pose(meta)[2])
         if mode == "SEARCH":
             heading, _, pos = pose(meta)
             set_mode("GOTO", new)
@@ -1404,7 +1560,7 @@ async def stream(ws: WebSocket):
     await ws.accept()
     PHONE["ws"], PHONE["loop"] = ws, asyncio.get_running_loop()
     print("Phone connected")
-    meta, expect, frame_k, bad_text = None, None, 0, False
+    meta, expect, frame_k, bad_text, pushed = None, None, 0, False, False
     try:
         while True:
             msg = await ws.receive()
@@ -1422,6 +1578,11 @@ async def stream(ws: WebSocket):
                     continue
                 if data.get("type") == "frame":
                     meta, expect = data, "jpeg"
+                    want = SETTINGS.get()["camera"]
+                    if not pushed and want != "auto" and data.get("camera") not in (None, want):
+                        send_phone({"type": "camera_mode", "zoom": want})   # e.g. 0.75x, the best-tested lens
+                        log_event("info", f"Asked the phone for the {want} lens")
+                    pushed = True
                 elif data.get("type") == "cmd":
                     threading.Thread(target=handle_command, args=(data.get("text", ""),), daemon=True).start()
                 elif data.get("type") == "planes":
@@ -1580,6 +1741,8 @@ def apply_setting(key, value):
         log_event("info", f"Camera set to {value}: tracking, map and memory reset")
     elif key == "orient":
         ORIENT["force"] = value
+    elif key in FIELD:
+        FIELD[key] = value
 
 
 SETTINGS = settings_mod.Settings(on_change=apply_setting)

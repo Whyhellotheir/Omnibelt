@@ -130,8 +130,6 @@ class WorldDetector:
 
     def _predict(self, model, frame, conf):
         kw = dict(conf=conf, verbose=False, imgsz=self.imgsz, agnostic_nms=False, max_det=60)
-        if not self.engine:
-            kw["half"] = True
         return model.predict(frame, **kw)[0]
 
     def detect(self, frame, conf=None):

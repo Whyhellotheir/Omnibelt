@@ -229,14 +229,14 @@ for(const q of ['find my keys','where did I leave my keys','walk','stop','descri
 }
 
 // ---- settings ----
-const DEF={camera:['auto','1x','0.75x','0.5x'],power:['15W','MAXN SUPER'],planner:[true,false],orient:['auto','portrait','landscape']};
-const LABEL={camera:'Camera',power:'Power',planner:'Planner',orient:'Orientation'};
-const NOTE={camera:'changing lens resets tracking + memory'};
+const DEF={camera:['auto','1x','0.75x','0.5x'],power:['15W','MAXN SUPER'],planner:[true,false],orient:['auto','portrait','landscape'],voice:['quiet','normal'],mirror_belt:[false,true],mirror_hands:[false,true]};
+const LABEL={camera:'Camera',power:'Power',planner:'Planner',orient:'Orientation',voice:'Voice',mirror_belt:'Mirror belt',mirror_hands:'Mirror hands'};
+const NOTE={camera:'changing lens resets tracking + memory',mirror_hands:'field fixes: flip if left/right feels backwards'};
 let setTimer=null;
 const show=v=>typeof v==='boolean'?(v?'on':'off'):String(v);
 function renderSettings(g){
   const opts=g.options||{};let h='';
-  for(const k of ['camera','power','planner','orient']){
+  for(const k of ['camera','power','planner','orient','voice','mirror_belt','mirror_hands']){
     let list=opts[k]||(k==='power'&&g.power_modes&&g.power_modes.length?g.power_modes:DEF[k]);
     if(!list||!list.length)list=DEF[k];
     const cur=g[k];
