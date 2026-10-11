@@ -143,14 +143,18 @@ class WorldDetector:
         return _parse(r, self.vocab)
 
     def detect_open(self, frame, target, conf=None):
-        """separate YOLO-World instance for words outside VOCAB (its own lock; never touches the fixed one)."""
+        """words outside VOCAB. Uses the shared strong model when the server set one (no extra copy in memory),
+        else a small open-vocab instance of the fast model."""
         if frame is None or not target:
             return []
+        strong = getattr(self, "strong", None)
+        if strong is not None and not strong.failed:
+            return strong.detect_open(frame, target, conf)
         with self.open_lock:
             try:
                 if self.open_model is None:
                     from ultralytics import YOLOWorld
-                    self.open_model = YOLOWorld(STRONG)       # unusual items: accuracy over speed
+                    self.open_model = YOLOWorld(self.model_path)   # no strong model: small one, low memory
                 if self.open_cls != target:
                     self.open_model.set_classes([target])
                     self.open_cls = target
@@ -481,20 +485,39 @@ class StrongDetector:
     """the big model, loaded once and used on demand (a find that the fast model missed). Same vocabulary."""
     def __init__(self, model_path=STRONG, conf=0.10):
         self.model_path, self.conf, self.lock, self.model, self.failed = model_path, conf, threading.Lock(), None, False
+        self.cls = None
+
+    def _ready(self, classes):
+        if self.model is None:
+            from ultralytics import YOLOWorld
+            self.model = YOLOWorld(self.model_path)
+            print("Strong detector ready:", self.model_path)
+        if self.cls != classes:
+            self.model.set_classes(list(classes))
+            self.cls = list(classes)
 
     def detect(self, frame):
         if self.failed or frame is None:
             return []
         with self.lock:
             try:
-                if self.model is None:
-                    from ultralytics import YOLOWorld
-                    self.model = YOLOWorld(self.model_path)
-                    self.model.set_classes(list(VOCAB))
-                    print("Strong detector ready:", self.model_path)
+                self._ready(VOCAB)
                 r = self.model.predict(frame, conf=self.conf, verbose=False, imgsz=640, max_det=60)[0]
             except Exception as e:
                 print("Strong detector off:", e)
                 self.failed = True
                 return []
         return _parse(r, list(VOCAB))
+
+    def detect_open(self, frame, target, conf=None):
+        if self.failed or frame is None:
+            return []
+        with self.lock:
+            try:
+                self._ready([target])
+                r = self.model.predict(frame, conf=max(0.15, self.conf) if conf is None else conf, verbose=False,
+                                       imgsz=640)[0]
+            except Exception as e:
+                print("open-vocab (strong) failed:", e)
+                return []
+        return [dict(d, label=target) for d in _parse(r, [target])]

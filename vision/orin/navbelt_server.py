@@ -91,7 +91,7 @@ BODY_RADIUS_M = 0.35       # keep the route this far from obstacles
 LOOKAHEAD_M = 0.8          # steer toward the point this far along the route
 OBST_MIN_H, OBST_MAX_H = 0.15, 1.9   # only things between ankle and head height count as obstacles
 RING = 8
-VERSION = "nav-accuracy w9"
+VERSION = "nav-accuracy w10"
 FIELD = {"mirror_belt": False, "mirror_hands": False, "voice": "quiet"}   # dashboard switches
 ORIENT = {"force": os.environ.get("ORIENT", "auto"), "k": 0}   # auto | portrait | landscape; k = current rotation
 W, H = 640, 480
@@ -954,6 +954,8 @@ def perception_loop():
             worker = depth_trt.DepthWorker(depth_trt.make_depth(os.path.dirname(os.path.abspath(__file__))))
         except Exception as e:
             print("Depth model off:", e)
+    mem_log("tracker + depth loaded")
+    CORE_READY.set()
     last_id, n, t0, depth, dmeta = -1, 0, time.time(), None, None
     ms = collections.defaultdict(float)
     while True:
@@ -1186,6 +1188,31 @@ TEACH_RE = re.compile(r"^\W*(?:this is|these are|here(?: is|'s| are)|remember th
 FORGET_RE = re.compile(r"^\W*forget (?:my |the |what )?(.+?)(?: looks? like)?[.!?]*$")
 
 
+LOW_MEM = os.environ.get("LOW_MEM", "0") == "1"   # no strong model; item-teaching model loads on first use
+CORE_READY = threading.Event()                       # set when the perception models are loaded
+
+
+def mem_log(tag):
+    """free memory after each model loads, so a crash log shows where memory ran out."""
+    try:
+        info = dict(l.split(":", 1) for l in open("/proc/meminfo"))
+        avail = int(info["MemAvailable"].split()[0]) // 1024
+        print(f"[mem] {tag}: {avail} MB available")
+    except Exception:
+        pass
+
+
+def warmup():
+    """load the optional models one by one once the core runs, instead of all at once at startup."""
+    CORE_READY.wait(180)
+    if STRONG_DET is not None:
+        STRONG_DET.detect(np.zeros((480, 640, 3), np.uint8))
+        mem_log("strong detector loaded")
+    if not LOW_MEM:
+        warm_teach()
+        mem_log("teach model loaded")
+
+
 def warm_teach():
     """load the CLIP image model in the background at startup, so teaching answers at once."""
     try:
@@ -1202,6 +1229,9 @@ def teach_item(label):
     if not label or DET is None:
         say("I can't learn items right now. The detector isn't running.")
         return
+    if not TEACH_STATE["ready"] and LOW_MEM and not TEACH_STATE["error"]:
+        say("Loading the item model, one moment.")
+        warm_teach()                                    # low-memory mode: load on first use
     if not TEACH_STATE["ready"]:
         say("The item learning model isn't installed on the Orin." if TEACH_STATE["error"]
             else "I'm still loading the item model. Try again in a moment.")
@@ -1936,16 +1966,18 @@ if __name__ == "__main__":
     BELT = Belt()
     try:                                                # fixed-vocab detector thread; old LocalFinder as fallback
         DET = finder.DetectorThread(finder.WorldDetector())
-        STRONG_DET = finder.StrongDetector()
-        threading.Thread(target=lambda: STRONG_DET.detect(np.zeros((480, 640, 3), np.uint8)), daemon=True).start()   # warm
+        if not LOW_MEM:
+            STRONG_DET = finder.StrongDetector()          # loaded later by warmup(), after the core models
+            DET.det.strong = STRONG_DET                   # unusual words share it (one L copy, not two)
         print("Detector thread ready:", len(finder.VOCAB), "words")
+        mem_log("fast detector loaded")
     except Exception as e:
         print("Detector thread off, using the old finder:", e)
         LOCAL = LocalFinder()
     BRAIN = Brain()
     GRID = FloorMap()
-    threading.Thread(target=warm_teach, daemon=True).start()
     for fn in (perception_loop, control_loop, refresher_loop, memory_loop, planner_loop):
         threading.Thread(target=fn, daemon=True).start()
+    threading.Thread(target=warmup, daemon=True).start()   # extras load one at a time, after the core is up
     print("Dashboard: http://orin.local:8765/   phone socket: ws://<this-ip>:8765/stream")
     uvicorn.run(app, host="0.0.0.0", port=8765, log_level="warning")
