@@ -91,7 +91,7 @@ BODY_RADIUS_M = 0.35       # keep the route this far from obstacles
 LOOKAHEAD_M = 0.8          # steer toward the point this far along the route
 OBST_MIN_H, OBST_MAX_H = 0.15, 1.9   # only things between ankle and head height count as obstacles
 RING = 8
-VERSION = "nav-accuracy w7"
+VERSION = "nav-accuracy w8"
 FIELD = {"mirror_belt": False, "mirror_hands": False, "voice": "quiet"}   # dashboard switches
 ORIENT = {"force": os.environ.get("ORIENT", "auto"), "k": 0}   # auto | portrait | landscape; k = current rotation
 W, H = 640, 480
@@ -635,6 +635,8 @@ def tile_detect(frame):
 
 
 EXIT_WORDS = ("exit", "exit door", "way out", "emergency exit", "the exit")
+DET_FAST_HZ = float(os.environ.get("DET_FAST_HZ", "8"))     # detector looks/s while finding or guiding
+DET_IDLE_HZ = float(os.environ.get("DET_IDLE_HZ", "3"))     # ...and otherwise (memory stays fresh, GPU left to steering)
 LEARNED_SIM = float(os.environ.get("LEARNED_SIM", "0.72"))   # how alike a crop must be to an auto-learned item
 WHERE_CLAUSE = re.compile(r"\s+(?:on|in|at|near|by|under|next to|beside|behind|inside|over|from)\s+(?:the|a|my|this|that)?\s*\S.*$")
 
@@ -704,6 +706,8 @@ def confirmed_find(frame, target, budget_s=0.8):
     """for a spoken find: watch a few detector results and lock only on a confirmed sighting (or the best one
     seen if time runs out), so a single wrong box doesn't send the wearer to the wrong object."""
     CONF.reset(target)
+    if DET is not None:
+        DET.set_rate(DET_FAST_HZ)                       # a spoken find wants every look it can get, now
     end, best, t = time.time() + budget_s, None, time.time() - 0.01
     while time.time() < end:
         items = local_find(frame, target, after_t=t, zoom=True)
@@ -998,8 +1002,12 @@ def perception_loop():
         if n % 5 == 0:
             with S.lock:
                 S.timing = {k: round(v, 1) for k, v in ms.items()}
+                if DET is not None:
+                    S.timing["world_ms"] = round(DET.ms, 1)
+            if DET is not None:                         # full-speed detector only while it matters
+                DET.set_rate(DET_FAST_HZ if S.mode in ("SEARCH", "GOTO", "REACH") else DET_IDLE_HZ)
         if n % 75 == 0:
-            print("timing:", {k: round(v, 1) for k, v in ms.items()}, f"fps {S.fps:.1f}",
+            print("timing:", dict({k: round(v, 1) for k, v in ms.items()}, world_ms=round(DET.ms, 1) if DET else None), f"fps {S.fps:.1f}",
                   f"depth {source} scale {DEPTH_SCALE.scale:.2f} ({DEPTH_SCALE.source or 'none'})")
 
 
@@ -1191,6 +1199,7 @@ def teach_item(label):
         say("The item learning model isn't installed on the Orin." if TEACH_STATE["error"]
             else "I'm still loading the item model. Try again in a moment.")
         return
+    DET.set_rate(DET_FAST_HZ)
     say(f"Hold your {label} in front of the camera.")
     time.sleep(1.5)                                     # give them time to hold it up
     n, t = 0, time.time()

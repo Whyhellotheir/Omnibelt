@@ -176,7 +176,7 @@ class DetectorThread:
     """runs detector.detect on the newest submitted frame, at most `hz` times a second. Older frames that
     arrive while it is busy are dropped. submit() and latest() never block on the GPU."""
     def __init__(self, detector, hz=8.0):
-        self.det, self.period = detector, 1.0 / hz
+        self.det, self.period, self.ms = detector, 1.0 / hz, 0.0
         self.cv = threading.Condition()
         self.pending, self.frame, self.result = None, None, ([], None, None, 0.0)
         self.processed, self.dropped, self.running = 0, 0, True
@@ -205,6 +205,9 @@ class DetectorThread:
                 self.cv.wait(left)
             return self.result
 
+    def set_rate(self, hz):
+        self.period = 1.0 / hz
+
     def stop(self):
         with self.cv:
             self.running = False
@@ -226,6 +229,7 @@ class DetectorThread:
             last = time.time()
             try:
                 dets = self.det.detect(job[0])
+                self.ms = 0.8 * self.ms + 0.2 * (time.time() - last) * 1000     # ms per look, for the dashboard
             except Exception as e:
                 print("detector error:", e)
                 dets = []
