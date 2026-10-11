@@ -65,3 +65,13 @@ A segmented "Camera" picker (Auto / 1x / 0.75x / 0.5x) and an "ARKit video forma
 - **F10 VoiceIO**: speech inside the reply window extends it by 2.5 s **at most once** per window (`replyExtended`, reset when the window opens). Before, every partial result extended it forever.
 - **F11 BeltStreamer.runSession**: for the wanted lens, a 4:3 ARKit format is preferred (`abs(w/h - 4/3) < 0.01` on `imageResolution`), then the first format of that device, then the old 1x fallback. Check the "ARKit video formats" list shows a 4:3 entry is picked (status/stream resolution should be 4:3).
 - Server side: the dashboard camera control now includes **auto** (default) and sends `{"type":"camera_mode","zoom":"auto"}`; re-selecting the current lens no longer resets anything.
+
+## Wave 3: speech reliability (rebuild needed)
+- **Wake word is now "Belt"** (`Config.wakeWords`: belt, omnibelt, omni belt, omni-belt, omni). A short real word is recognized far more reliably than "Omnibelt".
+- **Vocabulary hints:** `req.contextualStrings = Config.speechHints`, which biases recognition toward keys, wallet, water bottle, "where did I leave", and so on.
+- **Server recognition by default:** `Config.onDeviceSpeech = false` gives more accurate results over the hotspot's cellular. Set it to true if there's no internet.
+- **Listening cue:** a system click (sound 1113) plays the moment the wake word is heard.
+- **Smarter end of speech:** it sends after 0.7 s of silence when the sentence ends in a known word (keys, wallet, stop, …), otherwise after 1.6 s. Fewer cut-off commands.
+- **No self-triggers:** anything heard while the phone is speaking is ignored, unless it contains "stop". The belt's own "Follow the belt." can't fire a command.
+- **Compile notes:** this adds `import AudioToolbox` (for `AudioServicesPlaySystemSound`). No other new APIs.
+- **Test:** say "Belt, find my wallet" in a noisy room. You should hear the click, and the dashboard transcript should show "find my wallet".

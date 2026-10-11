@@ -215,7 +215,8 @@ Firmware safety limits:
 | Low fps | Depth and YOLO-World each run in their own thread. Depth uses a TensorRT engine when built. Per-stage timing is shown on the dashboard and printed every 75 frames. | `vision/orin/depth_trt.py` |
 | Memory overwritten by one bad sighting | Per-item position tracks (weighted median), move detection, stale marking, spoken answers | `vision/orin/memory.py` |
 
-**New voice commands**
+**New voice commands** (wake word is now **"Belt"**; "Omnibelt" still works. The Orin fixes common mishearings, e.g. "fine my walla" → "find my wallet".)
+- "Belt, reach" / "I'm here" forces the hand-over to the ring. Reach also fires on its own when your hand appears next to the item, or when the item sits low and large in the frame, at about 0.85 m. The dashboard `reach` field shows dist / source / box age / streak to say why.
 - "Where did I leave my keys?" answers from memory ("Your keys are on the table behind you, to your right, about 2 meters away"), then asks "Want me to take you there?". Say "yes" or "no" with no wake word; the window is 8 s.
 - "This is my wallet" / "these are my keys" / "remember this as my bottle": hold the item in front of the camera. It saves 6 reference views (CLIP), so later finds prefer *your* item.
 - "Forget my wallet."
@@ -273,3 +274,4 @@ After checkpoint 3: freeze, rehearse the 90 s demo five times, and record a back
 - 2026-10-10: Phone moves to the belt (front, navel). `CAM_HEIGHT_M` default changed 1.3 → 1.0; print the belt cradle, not the chest one.
 - 2026-10-10: Added the belt assembly plan from the claude.ai chat (order, % spacing, 16-piece wiring, fit fixes). The CAD-width check found the battery and Orin overlap under ~110 cm waist; rule: butt battery/Orin/hub together on the spine.
 - 2026-10-11: `nav-accuracy` branch. Six parallel module builds (geometry, depth engine, finder + teach, memory, dashboard + settings, iOS), wired into the server. Found and fixed a pixel-based confirmation bug that stopped target updates while walking; it now confirms in world space. Simulated table approach: reach fires at 0.67–0.72 m. Portrait frames are rotated through `/stream`; floor and backpack checks unchanged. iOS is not compiled yet (Helena).
+- 2026-10-11: Real-life feedback, wave 3. Item teaching now loads its model at startup (it used to hang on the first "this is my"). Wake word is "Belt", with vocabulary hints, a listening click, end-of-speech that adapts to the sentence, no self-triggers, and Orin-side correction of misheard words. Reach also fires on a hand near the item, the item low and large in frame, or "Belt, reach". Zoomed crops find small items. Version string shown in /state.

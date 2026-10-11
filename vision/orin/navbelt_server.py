@@ -91,6 +91,7 @@ BODY_RADIUS_M = 0.35       # keep the route this far from obstacles
 LOOKAHEAD_M = 0.8          # steer toward the point this far along the route
 OBST_MIN_H, OBST_MAX_H = 0.15, 1.9   # only things between ankle and head height count as obstacles
 RING = 8
+VERSION = "nav-accuracy w3"
 ORIENT = {"force": os.environ.get("ORIENT", "auto"), "k": 0}   # auto | portrait | landscape; k = current rotation
 W, H = 640, 480
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
@@ -188,7 +189,9 @@ class WorldConfirmer:
 
 CONF = WorldConfirmer()                      # a target counts after 3 of the last 5 looks agree (in world space)
 DEPTH_SCALE = geometry.DepthScale()          # pins the depth model to real metres (ARKit points, else the floor)
-REACH_GATE = geometry.ReachGate(reach_m=0.75)   # belt -> ring hand-over at arm's length
+REACH_GATE = geometry.ReachGate(reach_m=0.9)    # belt -> ring hand-over at arm's length
+TEACH_STATE = {"ready": False, "error": ""}      # CLIP image model, loaded at startup (not on the first "this is my ...")
+REACH_DBG = {}                                   # why reach did / didn't fire, for the dashboard
 ROTCV = {1: cv2.ROTATE_90_CLOCKWISE, 2: cv2.ROTATE_180, 3: cv2.ROTATE_90_COUNTERCLOCKWISE}
 GRID = None
 
@@ -554,7 +557,21 @@ class Brain:
             return "I can't describe the scene right now."
 
 
-def local_find(frame, target, after_t=None):
+def tile_detect(frame):
+    """2x zoom on the lower two thirds (where table and floor items are): two overlapping tiles, boxes mapped back."""
+    h, w = frame.shape[:2]
+    th, tw = int(h * 2 / 3), int(w * 0.55)
+    out = []
+    for x0 in (0, w - tw):
+        y0 = h - th
+        tile = cv2.resize(frame[y0:h, x0:x0 + tw], (tw * 2, th * 2), interpolation=cv2.INTER_LINEAR)
+        for d in DET.det.detect(tile):
+            b = d["box"]
+            out.append(dict(d, box=[b[0] / 2 + x0, b[1] / 2 + y0, b[2] / 2 + x0, b[3] / 2 + y0]))
+    return out
+
+
+def local_find(frame, target, after_t=None, zoom=False):
     """fixed-vocabulary detector thread (distractor-aware, taught items re-ranked); open-vocab for other words."""
     if DET is None:
         return LOCAL.detect(frame, [target]) if LOCAL is not None and LOCAL.model is not None else []
@@ -564,6 +581,10 @@ def local_find(frame, target, after_t=None):
         return []
     if finder.canonical(target) or TEACH.has(target):
         best = finder.pick_target(dets, target, TEACH, fr)
+        if best is None and zoom:
+            best = finder.pick_target(tile_detect(fr), target, TEACH, fr)   # small item: look again, zoomed in
+            if best is not None:
+                best = dict(best, zoomed=True)
         return [dict(best, meta=meta, label=target)] if best else []
     try:
         found = DET.det.detect_open(frame, target)
@@ -579,7 +600,7 @@ def confirmed_find(frame, target, budget_s=0.8):
     CONF.reset(target)
     end, best, t = time.time() + budget_s, None, time.time() - 0.01
     while time.time() < end:
-        items = local_find(frame, target, after_t=t)
+        items = local_find(frame, target, after_t=t, zoom=True)
         t = time.time()
         pos = lock_target(target, items[0]["box"], items[0].get("meta") or S.meta, S.depth)["pos"] if items else None
         if CONF.confirmed(target, pos, t) and items:
@@ -1003,12 +1024,28 @@ TEACH_RE = re.compile(r"^\W*(?:this is|these are|here(?: is|'s| are)|remember th
 FORGET_RE = re.compile(r"^\W*forget (?:my |the |what )?(.+?)(?: looks? like)?[.!?]*$")
 
 
+def warm_teach():
+    """load the CLIP image model in the background at startup, so teaching answers at once."""
+    try:
+        TEACH.embed([np.zeros((32, 32, 3), np.uint8)])
+        TEACH_STATE["ready"] = True
+        print("Teach model ready")
+    except Exception as e:
+        TEACH_STATE["error"] = str(e)[:120]
+        print("Teach model failed to load:", e)
+
+
 def teach_item(label):
-    """'this is my wallet': store what the held item looks like from a few frames (CLIP), so finds prefer it."""
+    """'this is my wallet': store what the item looks like from a few frames (CLIP), so finds prefer it."""
     if not label or DET is None:
-        say("I can't learn items right now.")
+        say("I can't learn items right now. The detector isn't running.")
+        return
+    if not TEACH_STATE["ready"]:
+        say("The item learning model isn't installed on the Orin." if TEACH_STATE["error"]
+            else "I'm still loading the item model. Try again in a moment.")
         return
     say(f"Hold your {label} in front of the camera.")
+    time.sleep(1.5)                                     # give them time to hold it up
     n, t = 0, time.time()
     for _ in range(4):
         got = DET.wait_newer(t, 1.0)
@@ -1029,12 +1066,51 @@ def teach_item(label):
     say(f"Got it. I'll know your {label} now." if n else f"I couldn't see your {label}. Try again closer to the camera.")
 
 
+WAKE_RE = re.compile(r"^\W*(?:hey |ok |okay )?(?:omni[ -]?belt|omni|belt)\b[\s,.!?]*")
+FIXES = {"fine": "find", "fined": "find", "fight": "find", "wallets": "wallet", "walla": "wallet", "wallace": "wallet",
+         "walt": "wallet", "key": "keys", "keyes": "keys", "kees": "keys", "keith": "keys", "bottles": "bottle",
+         "botel": "bottle", "model": "bottle", "rich": "reach", "breach": "reach", "speech": "reach",
+         "yeah": "yes", "yep": "yes", "nope": "no", "dory": "door", "gin": "keys"}
+LEXICON = ["find", "where", "take", "follow", "stop", "walk", "describe", "reach", "yes", "forget", "remember", "learn",
+           "keys", "wallet", "bottle", "water", "door", "chair", "glasses", "backpack", "laptop", "phone", "leave"]
+
+
+def fix_words(text):
+    """undo common speech-to-text slips for our small vocabulary ('fine my walla' -> 'find my wallet')."""
+    import difflib
+    t = WAKE_RE.sub("", text.lower().strip())
+    out = []
+    for w in t.split():
+        core = re.sub(r"[^a-z']", "", w)
+        if core in FIXES:
+            w = FIXES[core]
+        elif len(core) >= 5 and core not in LEXICON:
+            m = difflib.get_close_matches(core, LEXICON, n=1, cutoff=0.8)
+            w = m[0] if m else w
+        out.append(w)
+    return " ".join(out)
+
+
+REACH_RE = re.compile(r"^\W*(?:reach|reach mode|i'?m here|i am here|it'?s (?:close|here|right here)|grab it|i'?m close)\b")
+
+
 def handle_command(text):
+    text = fix_words(text)
     with S.lock:
         S.last_heard = text
         pending, S.pending = S.pending, None
     log_event("heard", text)
     t = text.lower().strip()
+    if REACH_RE.match(t):                               # manual hand-over to the ring
+        with S.lock:
+            tgt = S.target
+        if tgt and tgt.get("box") is not None:
+            start_reach(tgt)
+        elif tgt:
+            say(f"Point the belt at your {tgt['label']} so I can see it, then say reach again.")
+        else:
+            say("What should I reach for? Say find, then the item.")
+        return
     if pending and time.time() < pending["expires"]:
         if YES_RE.match(t):
             mem = pending.get("mem")
@@ -1180,8 +1256,23 @@ def control_loop():
             set_mode("IDLE")
             continue
         if mode == "GOTO" and gdist is not None and not tgt.get("walk_only"):
+            now = time.time()
             gd = gdist if tgt.get("dist_source") != "floor-guess" else None   # table items: trust only the box size
-            if REACH_GATE.update(tgt, gd, tgt.get("box"), H, time.time()):
+            box = tgt.get("box")
+            fresh = box is not None and now - tgt.get("box_t", 0) < 1.2
+            hand = pick_hand(meta.get("hands", []))
+            # the wearer's hand shows up next to the item = they're within reach
+            hand_near = fresh and hand is not None and \
+                box[0] - 0.6 * (box[2] - box[0]) - 60 <= hand[0] <= box[2] + 0.6 * (box[2] - box[0]) + 60
+            # item low in the frame and not tiny = close, whatever the depth scale says
+            low_big = fresh and box[3] > 0.72 * H and (box[3] - box[1]) > 0.08 * H
+            LAST["low_big"] = LAST.get("low_big", 0) + 1 if low_big else 0
+            gate = REACH_GATE.update(tgt, gd, box, H, now)
+            REACH_DBG.update(dist=None if gd is None else round(gd, 2), src=tgt.get("dist_source"),
+                             box_age=None if box is None else round(now - tgt.get("box_t", 0), 1),
+                             streak=REACH_GATE.streak, hand=hand is not None, low=LAST["low_big"])
+            if gate or hand_near or LAST["low_big"] >= 3:
+                LAST["low_big"] = 0
                 start_reach(tgt)
                 continue
         steer, near = goal, 9.9
@@ -1423,7 +1514,8 @@ async def state():
             "depth": S.depth_source, "phone": PHONE["ws"] is not None,
             "planner": ("route" if S.path else "dodge only") if USE_PLANNER else "off",
             "timing": dict(S.timing, fps=round(S.fps, 1)), "depth_source": S.depth_source,
-            "depth_scale": round(S.depth_scale, 3), "depth_scale_source": DEPTH_SCALE.source or "none",
+            "depth_scale": round(S.depth_scale, 3), "reach": dict(REACH_DBG),
+            "teach_ready": TEACH_STATE["ready"], "version": VERSION, "depth_scale_source": DEPTH_SCALE.source or "none",
             "pending": bool(S.pending),
             "memory": [dict(p, thumb=p["label"] in MEM.thumbs) for p in MEM.pins(time.time())],
             "taught": taught_list()})
@@ -1604,6 +1696,7 @@ if __name__ == "__main__":
         LOCAL = LocalFinder()
     BRAIN = Brain()
     GRID = FloorMap()
+    threading.Thread(target=warm_teach, daemon=True).start()
     for fn in (perception_loop, control_loop, refresher_loop, memory_loop, planner_loop):
         threading.Thread(target=fn, daemon=True).start()
     print("Dashboard: http://orin.local:8765/   phone socket: ws://<this-ip>:8765/stream")

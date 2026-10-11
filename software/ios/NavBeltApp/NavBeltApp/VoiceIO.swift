@@ -1,6 +1,7 @@
 import Foundation
 import Speech
 import AVFoundation
+import AudioToolbox
 import Combine
 
 /// Voice in: always-on speech recognition; anything said after the wake word ("Omnibelt") is sent as a command.
@@ -23,6 +24,7 @@ final class VoiceIO: NSObject, ObservableObject {
     private var replyUntil: Date?
     private var replyTimer: Timer?
     private var replyExtended = false
+    private var wakeChimed = false
 
     private var player: AVAudioPlayer?
     private let synth = AVSpeechSynthesizer()
@@ -67,7 +69,9 @@ final class VoiceIO: NSObject, ObservableObject {
         let session = recognitionSession
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
-        if recognizer.supportsOnDeviceRecognition { req.requiresOnDeviceRecognition = true }
+        req.contextualStrings = Config.speechHints          // bias recognition toward our words
+        if Config.onDeviceSpeech, recognizer.supportsOnDeviceRecognition { req.requiresOnDeviceRecognition = true }
+        wakeChimed = false
         request = req
         let input = engine.inputNode
         input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { [weak self] buffer, _ in
@@ -88,8 +92,13 @@ final class VoiceIO: NSObject, ObservableObject {
                         self.replyExtended = true
                         self.replyUntil = max(until, Date().addingTimeInterval(2.5))
                     }
+                    let woke = Config.wakeWords.contains { text.contains($0) }
+                    if woke && !self.wakeChimed {           // audible "I'm listening" cue
+                        self.wakeChimed = true
+                        AudioServicesPlaySystemSound(1113)
+                    }
                     self.debounce?.invalidate()
-                    self.debounce = Timer.scheduledTimer(withTimeInterval: 1.2, repeats: false) { _ in
+                    self.debounce = Timer.scheduledTimer(withTimeInterval: self.quietDelay(text, woke: woke), repeats: false) { _ in
                         guard session == self.recognitionSession else { return }
                         self.finish(text)
                     }
@@ -121,9 +130,21 @@ final class VoiceIO: NSObject, ObservableObject {
         request = nil
     }
 
+    /// How long to wait for silence before sending: short once the sentence sounds complete, longer mid-sentence.
+    private func quietDelay(_ text: String, woke: Bool) -> TimeInterval {
+        guard woke || replyUntil != nil else { return 1.2 }
+        let t = text.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+        return Config.completeEndings.contains { t.hasSuffix($0) } ? 0.7 : 1.6
+    }
+
     private func finish(_ text: String) {
         let trimmed = text.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
-        let wakePhrases = [Config.wakeWord, "omni belt", "omni-belt"]
+        // our own voice saying "...follow the belt" must not trigger a command; "stop" always gets through
+        if (player?.isPlaying == true || synth.isSpeaking) && !trimmed.contains("stop") {
+            listen()
+            return
+        }
+        let wakePhrases = Config.wakeWords
         let wakeRange = wakePhrases.compactMap {
             trimmed.range(of: $0, options: .backwards)
         }.max { $0.lowerBound < $1.lowerBound }
