@@ -91,7 +91,7 @@ BODY_RADIUS_M = 0.35       # keep the route this far from obstacles
 LOOKAHEAD_M = 0.8          # steer toward the point this far along the route
 OBST_MIN_H, OBST_MAX_H = 0.15, 1.9   # only things between ankle and head height count as obstacles
 RING = 8
-VERSION = "nav-accuracy w8"
+VERSION = "nav-accuracy w9"
 FIELD = {"mirror_belt": False, "mirror_hands": False, "voice": "quiet"}   # dashboard switches
 ORIENT = {"force": os.environ.get("ORIENT", "auto"), "k": 0}   # auto | portrait | landscape; k = current rotation
 W, H = 640, 480
@@ -164,6 +164,7 @@ BELT = None
 BRAIN = None
 LOCAL = None
 DET = None                                   # finder.DetectorThread: fixed-vocab YOLO-World on the newest frame
+STRONG_DET = None                            # finder.StrongDetector: the big model, only when the fast one misses
 TEACH = finder.TeachStore(os.path.join(os.path.dirname(os.path.abspath(__file__)), "taught"))
 
 
@@ -666,6 +667,12 @@ def local_find(frame, target, after_t=None, zoom=False):
             best = finder.pick_target(tile_detect(fr), target, TEACH, fr)   # small item: look again, zoomed in
             if best is not None:
                 best = dict(best, zoomed=True)
+        if best is None and zoom and STRONG_DET is not None:              # fast model missed: ask the big one once
+            best = finder.pick_target(STRONG_DET.detect(fr), target, TEACH, fr)
+            if best is not None:
+                best = dict(best, strong=True)
+                with S.lock:
+                    S.last_finder = "YOLO-World L"
         if best is not None and finder.canonical(target) == "door":
             doors = [d for d in dets if d["label"] == "door"]
             best = max(doors, key=lambda d: (d["box"][2] - d["box"][0]) * (d["box"][3] - d["box"][1]), default=best)
@@ -1929,6 +1936,8 @@ if __name__ == "__main__":
     BELT = Belt()
     try:                                                # fixed-vocab detector thread; old LocalFinder as fallback
         DET = finder.DetectorThread(finder.WorldDetector())
+        STRONG_DET = finder.StrongDetector()
+        threading.Thread(target=lambda: STRONG_DET.detect(np.zeros((480, 640, 3), np.uint8)), daemon=True).start()   # warm
         print("Detector thread ready:", len(finder.VOCAB), "words")
     except Exception as e:
         print("Detector thread off, using the old finder:", e)

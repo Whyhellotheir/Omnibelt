@@ -230,7 +230,7 @@ Firmware safety limits:
 
 **Orin setup (once, on good Wi-Fi)**, run from `vision/orin/`:
 1. `pip install git+https://github.com/ultralytics/CLIP.git ftfy regex`
-2. `python3 finder.py export`: builds `yolow_vocab_yolov8l-worldv2.engine`. The first run downloads the L model (~90 MB), so do it on good Wi-Fi. Re-run it if `VOCAB` changes. `FINDER_MODEL=yolov8s-worldv2.pt` falls back to the smaller, faster model, and `FINDER_ENGINE=0` ignores the engine.
+2. `python3 finder.py export`: builds the TensorRT engine for the **fast** always-on model (S, `yolow_vocab_yolov8s-worldv2.engine`). The **strong** model (L, ~90 MB download on the first start) is used only when S misses a spoken find, and for unusual items. Override with `FINDER_MODEL` / `FINDER_STRONG`. Re-export if `VOCAB` changes; `FINDER_ENGINE=0` ignores the engine.
 3. Depth engines: follow `vision/tests/DEPTH_ENGINE.md` (export the ONNX, then `trtexec --fp16` for 252x336 and 336x252). Without the engines it falls back to HF fp16 in a thread.
 4. Power switching from the dashboard: run `sudo visudo -f /etc/sudoers.d/omnibelt` and add `<user> ALL=(root) NOPASSWD: /usr/sbin/nvpmodel`. Then `sudo chmod 440 /etc/sudoers.d/omnibelt`. Check the modes with `sudo nvpmodel -q`.
 5. Settings: `ORIENT=auto|portrait|landscape` (dashboard too), `CAM_HEIGHT_M` = the measured lens height.

@@ -16,7 +16,8 @@ import numpy as np
 import cv2
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-MODEL = os.environ.get("FINDER_MODEL", "yolov8l-worldv2.pt")   # L: much better zero-shot than S; S if too slow
+MODEL = os.environ.get("FINDER_MODEL", "yolov8s-worldv2.pt")   # always-on detector: fast (S)
+STRONG = os.environ.get("FINDER_STRONG", "yolov8l-worldv2.pt")  # only when S misses, and for unusual items: accurate (L)
 _STEM = os.path.splitext(os.path.basename(MODEL))[0]
 ENGINE_PATH = os.path.join(HERE, f"yolow_vocab_{_STEM}.engine")  # named per model: an old S engine is never reused
 VOCAB_PT = os.path.join(HERE, f"yolow_vocab_{_STEM}.pt")
@@ -149,7 +150,7 @@ class WorldDetector:
             try:
                 if self.open_model is None:
                     from ultralytics import YOLOWorld
-                    self.open_model = YOLOWorld(self.model_path)
+                    self.open_model = YOLOWorld(STRONG)       # unusual items: accuracy over speed
                 if self.open_cls != target:
                     self.open_model.set_classes([target])
                     self.open_cls = target
@@ -474,3 +475,26 @@ if __name__ == "__main__":
         export_engine(sys.argv[2] if len(sys.argv) > 2 else MODEL)
     else:
         print("usage: python3 finder.py export [yolov8l-worldv2.pt]")
+
+
+class StrongDetector:
+    """the big model, loaded once and used on demand (a find that the fast model missed). Same vocabulary."""
+    def __init__(self, model_path=STRONG, conf=0.10):
+        self.model_path, self.conf, self.lock, self.model, self.failed = model_path, conf, threading.Lock(), None, False
+
+    def detect(self, frame):
+        if self.failed or frame is None:
+            return []
+        with self.lock:
+            try:
+                if self.model is None:
+                    from ultralytics import YOLOWorld
+                    self.model = YOLOWorld(self.model_path)
+                    self.model.set_classes(list(VOCAB))
+                    print("Strong detector ready:", self.model_path)
+                r = self.model.predict(frame, conf=self.conf, verbose=False, imgsz=640, max_det=60)[0]
+            except Exception as e:
+                print("Strong detector off:", e)
+                self.failed = True
+                return []
+        return _parse(r, list(VOCAB))
