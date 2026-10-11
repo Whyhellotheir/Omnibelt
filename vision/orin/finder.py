@@ -17,7 +17,7 @@ import cv2
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.environ.get("FINDER_MODEL", "yolov8s-worldv2.pt")   # always-on detector: fast (S)
-STRONG = os.environ.get("FINDER_STRONG", "yolov8l-worldv2.pt")  # only when S misses, and for unusual items: accurate (L)
+STRONG = os.environ.get("FINDER_STRONG", "")   # optional big model (e.g. yolov8l-worldv2.pt); off by default (memory)
 _STEM = os.path.splitext(os.path.basename(MODEL))[0]
 ENGINE_PATH = os.path.join(HERE, f"yolow_vocab_{_STEM}.engine")  # named per model: an old S engine is never reused
 VOCAB_PT = os.path.join(HERE, f"yolow_vocab_{_STEM}.pt")

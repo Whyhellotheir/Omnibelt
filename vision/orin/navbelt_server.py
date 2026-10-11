@@ -91,7 +91,7 @@ BODY_RADIUS_M = 0.35       # keep the route this far from obstacles
 LOOKAHEAD_M = 0.8          # steer toward the point this far along the route
 OBST_MIN_H, OBST_MAX_H = 0.15, 1.9   # only things between ankle and head height count as obstacles
 RING = 8
-VERSION = "nav-accuracy w11"
+VERSION = "nav-accuracy w12"
 FIELD = {"mirror_belt": False, "mirror_hands": False, "voice": "quiet"}   # dashboard switches
 ORIENT = {"force": os.environ.get("ORIENT", "auto"), "k": 0}   # auto | portrait | landscape; k = current rotation
 W, H = 640, 480
@@ -1113,6 +1113,7 @@ def start_find(target, walk_only=False, ask_first=False, desc=None):
         if not items:
             items = confirmed_find(frame, target)
         if not items and not unusual and gemini_online():
+            say("Let me look closer.")                   # Gemini takes a second or two: no dead air
             items = BRAIN._boxes(frame, FIND_PROMPT.format(target=desc or target), models=BRAIN.models + BRAIN.light)
     if items:
         meta = items[0].get("meta") or meta
@@ -1971,7 +1972,7 @@ if __name__ == "__main__":
     BELT = Belt()
     try:                                                # fixed-vocab detector thread; old LocalFinder as fallback
         DET = finder.DetectorThread(finder.WorldDetector())
-        if not LOW_MEM:
+        if finder.STRONG and not LOW_MEM:                # off unless FINDER_STRONG names a model
             STRONG_DET = finder.StrongDetector()          # loaded later by warmup(), after the core models
             DET.det.strong = STRONG_DET                   # unusual words share it (one L copy, not two)
         print("Detector thread ready:", len(finder.VOCAB), "words")
