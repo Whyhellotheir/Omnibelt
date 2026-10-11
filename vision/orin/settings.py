@@ -19,7 +19,7 @@ import threading
 
 NVP_CONF = "/etc/nvpmodel.conf"
 NVP_BIN = "/usr/sbin/nvpmodel"
-CAMERAS = ("1x", "0.75x", "0.5x")
+CAMERAS = ("auto", "1x", "0.75x", "0.5x")
 ORIENTS = ("auto", "portrait", "landscape")
 POWER_DISPLAY = ("7W", "15W", "25W", "MAXN SUPER")  # whitelist of display names
 
@@ -57,7 +57,7 @@ class Settings:
     def __init__(self, on_change=None, conf_path=NVP_CONF):
         self.lock = threading.Lock()
         self.on_change = on_change
-        self.values = {"camera": "1x", "planner": True, "orient": "auto", "power": None}
+        self.values = {"camera": "auto", "planner": True, "orient": "auto", "power": None}
         self.modes = {}
         self.dry_run = True
         try:
@@ -106,6 +106,8 @@ class Settings:
         else:
             return False, f"unknown setting {key!r}"
         with self.lock:
+            if self.values.get(key) == value:   # re-selecting the current value must not reset the phone/map
+                return True, f"{key} already {value}"
             self.values[key] = value
         if self.on_change:
             try:
@@ -119,6 +121,9 @@ class Settings:
             return False, "power switching unavailable: no /etc/nvpmodel.conf (not a Jetson), dry-run only"
         if not isinstance(value, str) or value not in self.modes:
             return False, f"power must be one of {', '.join(self.modes) or 'none available'}"
+        with self.lock:
+            if self.values.get("power") == value:
+                return True, f"power already {value}"
         mid = self.modes[value]  # whitelisted id from conf, never client input
         try:
             r = subprocess.run(["sudo", "-n", NVP_BIN, "-m", str(mid)], input="NO\n", timeout=20,

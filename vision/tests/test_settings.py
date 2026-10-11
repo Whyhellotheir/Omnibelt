@@ -28,7 +28,7 @@ s = settings.Settings(conf_path="/nonexistent/nvpmodel.conf")
 ok, msg = s.set("power", "15W")
 assert not ok and "dry-run" in msg, msg
 g = s.get()
-assert g["dry_run"] and g["power_modes"] == [] and g["camera"] == "1x" and g["planner"] is True
+assert g["dry_run"] and g["power_modes"] == [] and g["camera"] == "auto" and "auto" in g["options"]["camera"] and g["planner"] is True
 print("OK dry-run:", msg)
 
 # validation and on_change
@@ -41,7 +41,11 @@ assert calls == []
 assert s.set("camera", "0.5x")[0] and s.set("orient", "portrait")[0] and s.set("planner", "off")[0] and s.set("planner", True)[0]
 assert calls == [("camera", "0.5x"), ("orient", "portrait"), ("planner", False), ("planner", True)], calls
 assert s.get()["camera"] == "0.5x" and s.get()["orient"] == "portrait"
-print("OK validation + on_change")
+ok, msg = s.set("camera", "0.5x")
+assert ok and "already" in msg and len(calls) == 4, (msg, calls)   # same value: no-op, no on_change
+assert s.set("planner", True)[0] and len(calls) == 4
+assert s.set("camera", "auto")[0] and calls[-1] == ("camera", "auto")
+print("OK validation + on_change + same-value no-op")
 
 # jetson path with mocked conf + subprocess
 path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_nvpmodel.conf")
@@ -61,6 +65,9 @@ try:
         ok, msg = s.set("power", "MAXN SUPER")
         assert ok and "reboot" in msg, msg
         assert fake_run.last[0] == ["sudo", "-n", "/usr/sbin/nvpmodel", "-m", "2"] and fake_run.last[1]["input"] == "NO\n"
+        fake_run.last = None
+        ok, msg = s.set("power", "MAXN SUPER")
+        assert ok and "already" in msg and fake_run.last is None, msg   # same mode: nvpmodel not run again
 finally:
     os.remove(path)
 print("OK power switch (mocked)")

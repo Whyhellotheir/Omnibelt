@@ -846,7 +846,7 @@ def perception_loop():
             if got is not None and got[0].shape[:2] == frame.shape[:2]:
                 depth, dmeta, _, _, ms["depth_ms"] = got[0], got[1], got[2], got[3], got[4]
                 depth = scale_depth(depth, dmeta)
-                source = "estimated, scale %.2f (%s)" % (DEPTH_SCALE.scale, DEPTH_SCALE.source or "none")
+                source = "estimated"
             else:
                 depth = None
         else:
@@ -872,7 +872,8 @@ def perception_loop():
             with S.lock:
                 S.timing = {k: round(v, 1) for k, v in ms.items()}
         if n % 75 == 0:
-            print("timing:", {k: round(v, 1) for k, v in ms.items()}, f"fps {S.fps:.1f}")
+            print("timing:", {k: round(v, 1) for k, v in ms.items()}, f"fps {S.fps:.1f}",
+                  f"depth {source} scale {DEPTH_SCALE.scale:.2f} ({DEPTH_SCALE.source or 'none'})")
 
 
 def scale_depth(depth, meta):
@@ -949,7 +950,8 @@ def start_find(target, walk_only=False, ask_first=False):
         if ask_first:                                   # "where did I leave...": answer, then offer to guide
             set_mode("IDLE")
             with S.lock:
-                S.pending = {"type": "goto", "target": target, "walk_only": walk_only, "expires": time.time() + 12}
+                S.pending = {"type": "goto", "target": target, "walk_only": walk_only, "expires": time.time() + 12,
+                             "mem": dict(mem)}
             say(MEM.describe(mem, heading, pos, time.time()) + " Want me to take you there?")
             return
         rel = wrap(heading_to(pos, mem["pos"])[0] - heading)
@@ -1035,7 +1037,15 @@ def handle_command(text):
     t = text.lower().strip()
     if pending and time.time() < pending["expires"]:
         if YES_RE.match(t):
-            start_find(pending["target"], pending.get("walk_only", False))
+            mem = pending.get("mem")
+            if mem and mem.get("pos") is not None:   # go straight to the remembered spot; GOTO re-finds it live
+                _, meta, _ = latest()
+                heading, _, pos = pose(meta or {})
+                set_mode("GOTO", {"label": pending["target"], "pos": mem["pos"], "dist": None, "box": None,
+                                  "in_view": False, "box_t": 0.0, "walk_only": pending.get("walk_only", False)})
+                say(MEM.describe(mem, heading, pos, time.time()) + " Follow the belt.")
+            else:
+                start_find(pending["target"], pending.get("walk_only", False))
             return
         if NO_RE.match(t):
             say("Okay.")
@@ -1303,14 +1313,22 @@ async def stream(ws: WebSocket):
     await ws.accept()
     PHONE["ws"], PHONE["loop"] = ws, asyncio.get_running_loop()
     print("Phone connected")
-    meta, expect, frame_k = None, None, 0
+    meta, expect, frame_k, bad_text = None, None, 0, False
     try:
         while True:
             msg = await ws.receive()
             if msg.get("type") == "websocket.disconnect":
                 break
             if msg.get("text") is not None:
-                data = json.loads(msg["text"])
+                try:
+                    data = json.loads(msg["text"])
+                except ValueError:
+                    if not bad_text:
+                        print("ignoring non-JSON text from phone:", msg["text"][:80])
+                    bad_text = True
+                    continue
+                if not isinstance(data, dict):
+                    continue
                 if data.get("type") == "frame":
                     meta, expect = data, "jpeg"
                 elif data.get("type") == "cmd":
@@ -1334,7 +1352,7 @@ async def stream(ws: WebSocket):
                             frame_k = 1 if force == "portrait" else 0
                         ORIENT["k"] = frame_k
                         img, m = geometry.apply_rotation(img, m, frame_k)
-                    elif FLIP_IMAGE:
+                    elif FLIP_IMAGE and "rot" not in m:
                         img = cv2.rotate(img, cv2.ROTATE_180)
                         for hd in m.get("hands", []):
                             for k in ("wrist", "thumb", "index", "middle", "ring", "little"):
@@ -1405,7 +1423,8 @@ async def state():
             "depth": S.depth_source, "phone": PHONE["ws"] is not None,
             "planner": ("route" if S.path else "dodge only") if USE_PLANNER else "off",
             "timing": dict(S.timing, fps=round(S.fps, 1)), "depth_source": S.depth_source,
-            "depth_scale": round(S.depth_scale, 3), "pending": bool(S.pending),
+            "depth_scale": round(S.depth_scale, 3), "depth_scale_source": DEPTH_SCALE.source or "none",
+            "pending": bool(S.pending),
             "memory": [dict(p, thumb=p["label"] in MEM.thumbs) for p in MEM.pins(time.time())],
             "taught": taught_list()})
 
@@ -1481,7 +1500,7 @@ async def get_settings():
 
 @app.post("/settings")
 async def post_settings(payload: dict = Body(...)):
-    results = [SETTINGS.set(k, v) for k, v in payload.items()]
+    results = [await asyncio.to_thread(SETTINGS.set, k, v) for k, v in payload.items()]  # nvpmodel can block 20 s
     ok = all(r[0] for r in results) if results else False
     return {"ok": ok, "message": "; ".join(r[1] for r in results)}
 

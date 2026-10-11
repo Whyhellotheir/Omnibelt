@@ -39,7 +39,7 @@ button.q:hover,.seg button:hover:not(.on){border-color:var(--acc)}
 .note{font-size:15px;color:var(--dim);margin:2px 0 0 154px}
 #setmsg{min-height:26px;font-weight:700;margin-top:8px}
 #setmsg.ok{color:var(--ok)}#setmsg.bad{color:var(--bad)}
-#log{height:380px;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding-right:6px;scroll-behavior:smooth}
+#log{height:380px;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding-right:6px}
 .msg{max-width:85%;padding:10px 16px;border-radius:18px;font-size:22px;word-wrap:break-word}
 .msg.heard{align-self:flex-start;background:#223044;border-bottom-left-radius:4px}
 .msg.said{align-self:flex-end;background:#3a2c0c;color:#ffd98a;border-bottom-right-radius:4px}
@@ -177,8 +177,7 @@ async function tick(){
     $('target').textContent=s.target?'→ '+s.target:'';
     $('fps').innerHTML='<b>'+(s.fps!=null?(+s.fps).toFixed(1):'--')+'</b> fps';
     const t=s.timing||{};$('speed').innerHTML=bars(t);
-    const ds=[];if(s.depth_source||s.depth)ds.push(s.depth_source||s.depth);
-    $('depthsrc').textContent=(s.depth_scale!=null?'scale '+(+s.depth_scale).toFixed(2):'')+((s.depth_scale!=null&&ds.length)?' · ':'')+ds.join('');
+    $('depthsrc').textContent=[s.depth_source||s.depth||'',s.depth_scale!=null?'scale '+(+s.depth_scale).toFixed(2)+' · '+(s.depth_scale_source||'none'):''].filter(Boolean).join(', ');
     const ml=(Array.isArray(s.memory)?s.memory:[]).map(m=>Array.isArray(m)?{label:m[0],age_s:m[1]}:m);
     const mk=JSON.stringify(ml.map(m=>[m.label,m.moved,m.stale]));
     if(mk!==memKey){memKey=mk;$('mem').innerHTML=memCards(ml);} // rebuild only on change so thumbnails do not flicker
@@ -193,20 +192,25 @@ setInterval(tick,200);belt({});
 let lastI=-1,ws=null,retry=500;
 function addMsg(m){
   if(typeof m.i==='number'){if(m.i<=lastI)return;lastI=m.i;}
-  const log=$('log'),near=log.scrollHeight-log.scrollTop-log.clientHeight<80;
+  const log=$('log');
   const who=m.who==='heard'||m.who==='said'?m.who:'info';
   const d=document.createElement('div');d.className='msg '+who;
   if(who!=='info'){const sm=document.createElement('small');sm.textContent=who==='heard'?'Heard':'Belt';d.appendChild(sm);}
   d.appendChild(document.createTextNode(m.text||''));
   log.appendChild(d);
   while(log.children.length>200)log.removeChild(log.firstChild);
-  if(near)log.scrollTop=log.scrollHeight;
+}
+let first=true;
+function addBatch(list){ // stick to the bottom unless the user scrolled up >80px; decided once per batch
+  const log=$('log'),stick=first||log.scrollHeight-log.scrollTop-log.clientHeight<80;
+  list.forEach(addMsg);first=false;
+  if(stick)log.scrollTop=log.scrollHeight;
 }
 function connect(){
   try{
     ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/events');
     ws.onopen=()=>{retry=500;};
-    ws.onmessage=e=>{try{const m=JSON.parse(e.data);if(Array.isArray(m))m.forEach(addMsg);else addMsg(m);}catch(x){}};
+    ws.onmessage=e=>{try{const m=JSON.parse(e.data);addBatch(Array.isArray(m)?m:[m]);}catch(x){}};
     ws.onclose=()=>{setTimeout(connect,retry);retry=Math.min(5000,retry*1.6);};
     ws.onerror=()=>{try{ws.close();}catch(x){}};
   }catch(e){setTimeout(connect,2000);}
@@ -225,7 +229,7 @@ for(const q of ['find my keys','where did I leave my keys','walk','stop','descri
 }
 
 // ---- settings ----
-const DEF={camera:['1x','0.75x','0.5x'],power:['15W','MAXN SUPER'],planner:[true,false],orient:['auto','portrait','landscape']};
+const DEF={camera:['auto','1x','0.75x','0.5x'],power:['15W','MAXN SUPER'],planner:[true,false],orient:['auto','portrait','landscape']};
 const LABEL={camera:'Camera',power:'Power',planner:'Planner',orient:'Orientation'};
 const NOTE={camera:'changing lens resets tracking + memory'};
 let setTimer=null;

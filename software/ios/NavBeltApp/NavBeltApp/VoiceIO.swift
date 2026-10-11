@@ -22,6 +22,7 @@ final class VoiceIO: NSObject, ObservableObject {
     /// Reply window: after the Orin asks a question, the next utterance is sent without the wake word.
     private var replyUntil: Date?
     private var replyTimer: Timer?
+    private var replyExtended = false
 
     private var player: AVAudioPlayer?
     private let synth = AVSpeechSynthesizer()
@@ -82,7 +83,9 @@ final class VoiceIO: NSObject, ObservableObject {
                     let text = result.bestTranscription.formattedString.lowercased()
                     self.lastHeard = text
                     // Speech that starts inside the reply window keeps it open until the utterance finishes.
-                    if let until = self.replyUntil, Date() < until {
+                    // At most one extension per window, so ambient chatter can't hold it open forever.
+                    if let until = self.replyUntil, Date() < until, !self.replyExtended {
+                        self.replyExtended = true
                         self.replyUntil = max(until, Date().addingTimeInterval(2.5))
                     }
                     self.debounce?.invalidate()
@@ -133,7 +136,9 @@ final class VoiceIO: NSObject, ObservableObject {
                 lastHeard = "→ " + command
                 replyUntil = nil
             }
-        } else if let until = replyUntil, Date() < until, !trimmed.isEmpty, !isEcho(trimmed) {
+        } else if let until = replyUntil, Date() < until, !trimmed.isEmpty, !isEcho(trimmed),
+                  player?.isPlaying != true, !synth.isSpeaking,
+                  trimmed.split(separator: " ").count <= 4 {   // short replies only, never while we're talking
             streamer?.sendCommand(trimmed)          // e.g. "yes" / "no" right after a question
             lastHeard = "↩ " + trimmed
             replyUntil = nil
@@ -155,6 +160,7 @@ final class VoiceIO: NSObject, ObservableObject {
         replyTimer?.invalidate()
         replyTimer = Timer.scheduledTimer(withTimeInterval: max(0.1, delay), repeats: false) { [weak self] _ in
             guard let self, self.active else { return }
+            self.replyExtended = false
             self.replyUntil = Date().addingTimeInterval(Config.replyWindowSeconds)
             self.listen()
         }
@@ -162,6 +168,8 @@ final class VoiceIO: NSObject, ObservableObject {
 
     // MARK: - Speaking
     func say(_ text: String) {
+        replyUntil = nil                            // any new speech closes an open reply window
+        replyTimer?.invalidate()
         lastSaid = text
         let question = text.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
         if let data = cache[text.lowercased()] { play(data, question: question); return }

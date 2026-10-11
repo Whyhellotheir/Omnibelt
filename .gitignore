@@ -28,3 +28,7 @@ xcuserdata/
 
 # local clone folder
 /Omnibelt/
+
+# taught items written on the Orin
+vision/orin/taught/
+vision/orin/*.npz

@@ -59,3 +59,9 @@ A segmented "Camera" picker (Auto / 1x / 0.75x / 0.5x) and an "ARKit video forma
 - The server currently resizes every JPEG to its global `W,H` (640x480) and applies `FLIP_IMAGE`. With `rot` present it should use `meta["W"], meta["H"]` and skip its own rotation.
 - In Auto, the legacy lens switch still does `session.run(config)` **without** resetting tracking (old behavior). Fixed profiles always reset.
 - `lens` (camera label/crop flag) is snapshotted per frame in `didUpdate`. For a few frames right after a switch, the label can be stale. A fixed-profile switch also resets tracking, so those frames have `tracking:false`.
+
+## Review fixes (please build + check on device)
+- **F9 VoiceIO reply window**: `say(_:)` now closes any open reply window first (`replyUntil = nil`, `replyTimer?.invalidate()`), so the belt's own short cues ("left", "forward") can't be sent back as commands. A no-wake-word reply is only accepted while nothing is playing (`player?.isPlaying != true`, `!synth.isSpeaking`) and if it is at most 4 words; the echo check stays. Test: after "Want me to take you there?", "yes" still works; a long sentence from someone nearby does not.
+- **F10 VoiceIO**: speech inside the reply window extends it by 2.5 s **at most once** per window (`replyExtended`, reset when the window opens). Before, every partial result extended it forever.
+- **F11 BeltStreamer.runSession**: for the wanted lens, a 4:3 ARKit format is preferred (`abs(w/h - 4/3) < 0.01` on `imageResolution`), then the first format of that device, then the old 1x fallback. Check the "ARKit video formats" list shows a 4:3 entry is picked (status/stream resolution should be 4:3).
+- Server side: the dashboard camera control now includes **auto** (default) and sends `{"type":"camera_mode","zoom":"auto"}`; re-selecting the current lens no longer resets anything.

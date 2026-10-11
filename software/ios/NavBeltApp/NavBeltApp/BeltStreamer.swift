@@ -201,9 +201,12 @@ final class BeltStreamer: NSObject, ObservableObject, ARSessionDelegate {
         if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
             config.frameSemantics.insert(.sceneDepth)
         }
-        if let format = ARWorldTrackingConfiguration.supportedVideoFormats.first(where: {
-            $0.captureDeviceType == wanted.device
-        }) {
+        let formats = ARWorldTrackingConfiguration.supportedVideoFormats.filter { $0.captureDeviceType == wanted.device }
+        let fourThree = formats.first(where: {   // prefer 4:3 (full sensor FOV) over 16:9 crops
+            let r = $0.imageResolution
+            return r.height > 0 && abs(r.width / r.height - 4.0 / 3.0) < 0.01
+        })
+        if let format = fourThree ?? formats.first {
             config.videoFormat = format
             lens = wanted
         } else {
