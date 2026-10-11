@@ -244,7 +244,7 @@ def describe(entry, heading_deg, pos_xz, now=None):
     where = " ".join(p for p in (surface_words(entry.get("height")), dir_words(rel)) if p)
     s = f"Your {label} {'are' if plural else 'is'} {where}, {dist_words(float(np.hypot(*d)))}."
     age = now - float(entry["t"])
-    if age > 20:
+    if age > 5:                                       # demo asks within seconds; still skip "0 seconds ago"
         ago = f"{int(age)} seconds" if age <= 90 else f"{int(age / 60 + 0.5)} minutes"
         s += f" I saw {'them' if plural else 'it'} {ago} ago."
     return s

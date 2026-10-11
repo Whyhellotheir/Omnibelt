@@ -87,7 +87,8 @@ assert got == "Your keys are on the table behind you, to your left, about 2 mete
 # age phrasing
 assert m.describe(ent("keys", (0, -2), 0.75, NOW - 45), 0, (0, 0), NOW).endswith("I saw them 45 seconds ago.")
 assert m.describe(ent("keys", (0, -2), 0.75, NOW - 300), 0, (0, 0), NOW).endswith("I saw them 5 minutes ago.")
-assert "ago" not in m.describe(ent("keys", (0, -2), 0.75, NOW - 15), 0, (0, 0), NOW)
+assert "ago" not in m.describe(ent("keys", (0, -2), 0.75, NOW - 3), 0, (0, 0), NOW)
+assert m.describe(ent("keys", (0, -2), 0.75, NOW - 12), 0, (0, 0), NOW).endswith("I saw them 12 seconds ago.")
 assert "I saw it" in m.describe(ent("wallet", (0, -2), 0.75, NOW - 45), 0, (0, 0), NOW)
 assert len(m.describe(ent("keys", (1, 2), 0.75, NOW - 300), 0, (0, 0), NOW).split()) <= 22
 print("OK describe:", got)
