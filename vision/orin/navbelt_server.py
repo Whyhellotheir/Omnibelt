@@ -91,7 +91,7 @@ BODY_RADIUS_M = 0.35       # keep the route this far from obstacles
 LOOKAHEAD_M = 0.8          # steer toward the point this far along the route
 OBST_MIN_H, OBST_MAX_H = 0.15, 1.9   # only things between ankle and head height count as obstacles
 RING = 8
-VERSION = "nav-accuracy w10"
+VERSION = "nav-accuracy w11"
 FIELD = {"mirror_belt": False, "mirror_hands": False, "voice": "quiet"}   # dashboard switches
 ORIENT = {"force": os.environ.get("ORIENT", "auto"), "k": 0}   # auto | portrait | landscape; k = current rotation
 W, H = 640, 480
@@ -1215,6 +1215,11 @@ def warmup():
 
 def warm_teach():
     """load the CLIP image model in the background at startup, so teaching answers at once."""
+    free = finder.mem_available_mb()
+    if free is not None and free < 900:                 # better no teaching than a crashed server
+        TEACH_STATE["error"] = f"only {free} MB free"
+        print("Teach model skipped:", TEACH_STATE["error"])
+        return
     try:
         TEACH.embed([np.zeros((32, 32, 3), np.uint8)])
         TEACH_STATE["ready"] = True

@@ -22,6 +22,20 @@ _STEM = os.path.splitext(os.path.basename(MODEL))[0]
 ENGINE_PATH = os.path.join(HERE, f"yolow_vocab_{_STEM}.engine")  # named per model: an old S engine is never reused
 VOCAB_PT = os.path.join(HERE, f"yolow_vocab_{_STEM}.pt")
 
+def mem_available_mb():
+    """free memory (MB) on the Orin; None where /proc/meminfo doesn't exist."""
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except Exception:
+        return None
+    return None
+
+
+STRONG_MIN_MB = int(os.environ.get("STRONG_MIN_MB", "1800"))   # don't load the big model below this
+
+
 DEMO = ["keys", "wallet", "water bottle"]
 MEMORY = ["glasses", "cup", "backpack", "bag", "laptop", "door", "chair"]
 # look-alikes: in the vocabulary only so they soak up confusions (a phone gets "phone", not "wallet")
@@ -148,22 +162,24 @@ class WorldDetector:
         if frame is None or not target:
             return []
         strong = getattr(self, "strong", None)
-        if strong is not None and not strong.failed:
-            return strong.detect_open(frame, target, conf)
-        with self.open_lock:
+        if strong is not None and strong.model is not None and not strong.failed:
+            return strong.detect_open(frame, target, conf)       # already in memory: free to use
+        if self.engine or self.model is None:
+            return []                                            # a TensorRT engine can't change words: Gemini covers it
+        with self.lock:                                          # same model, words swapped for one look: no extra memory
             try:
-                if self.open_model is None:
-                    from ultralytics import YOLOWorld
-                    self.open_model = YOLOWorld(self.model_path)   # no strong model: small one, low memory
-                if self.open_cls != target:
-                    self.open_model.set_classes([target])
-                    self.open_cls = target
-                r = self.open_model.predict(frame, conf=max(0.15, self.conf) if conf is None else conf,
-                                            verbose=False, imgsz=self.imgsz)[0]
+                self.model.set_classes([target])
+                r = self.model.predict(frame, conf=max(0.15, self.conf) if conf is None else conf,
+                                       verbose=False, imgsz=self.imgsz)[0]
             except Exception as e:
                 print("open-vocab detect failed:", e)
-                return []
-        return [dict(d, label=target) for d in _parse(r, [target])]
+                r = None
+            finally:
+                try:
+                    self.model.set_classes(self.vocab)
+                except Exception as e:
+                    print("could not restore the vocabulary:", e)
+        return [dict(d, label=target) for d in _parse(r, [target])] if r is not None else []
 
 
 def export_engine(model_path=MODEL, imgsz=640):
@@ -489,6 +505,9 @@ class StrongDetector:
 
     def _ready(self, classes):
         if self.model is None:
+            free = mem_available_mb()
+            if free is not None and free < STRONG_MIN_MB:
+                raise RuntimeError(f"only {free} MB free (< {STRONG_MIN_MB}): not loading the strong model")
             from ultralytics import YOLOWorld
             self.model = YOLOWorld(self.model_path)
             print("Strong detector ready:", self.model_path)
