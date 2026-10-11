@@ -29,11 +29,16 @@ everything on it (including obstacles no longer in view); the dodge layer still 
 Threads: perception (YOLO + depth + map update every frame) -> planner (2.5 Hz) -> control (10 Hz motors) ;
          refresher (re-finds the target) ; memory (logs where objects were seen).
 """
-import asyncio, glob, json, math, os, re, threading, time
+import asyncio, collections, glob, json, math, os, re, sys, threading, time
 import urllib.error
 import urllib.request
 import numpy as np
 import cv2
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # sibling modules below
+import memory as memory_mod
+import settings as settings_mod
+import depth_trt
+import finder
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, Response
@@ -85,6 +90,7 @@ BODY_RADIUS_M = 0.35       # keep the route this far from obstacles
 LOOKAHEAD_M = 0.8          # steer toward the point this far along the route
 OBST_MIN_H, OBST_MAX_H = 0.15, 1.9   # only things between ankle and head height count as obstacles
 RING = 8
+ORIENT = {"force": os.environ.get("ORIENT", "auto"), "k": 0}   # auto | portrait | landscape; k = current rotation
 W, H = 640, 480
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "")
@@ -132,15 +138,31 @@ class State:
         self.path, self.path_t = None, 0.0
         self.map_vis = None
         self.cols = None          # per-column nearest obstacle distance (64 columns), for the map
+        self.timing = {}          # ms per stage + fps, for the dashboard
+        self.depth_scale = 1.0
+        self.pending = None       # {"type": "goto", "target": label, "expires": t} after "Want me to take you there?"
 
 
 S = State()
+MEM = memory_mod.Memory()
+EVENTS = collections.deque(maxlen=200)          # transcript for the dashboard: (i, t, who, text)
+EVENTS_LOCK = threading.Lock()
+
+
+def log_event(who, text):
+    with EVENTS_LOCK:
+        i = EVENTS[-1][0] + 1 if EVENTS else 1
+        EVENTS.append((i, time.time(), who, text))
 PHONE = {"ws": None, "loop": None}
 LAST = {"sweep": 0.0, "hint": 0.0, "inside_since": 0.0, "gemini": 0.0}
 GEMINI_LOCK = threading.Lock()
 BELT = None
 BRAIN = None
 LOCAL = None
+DET = None                                   # finder.DetectorThread: fixed-vocab YOLO-World on the newest frame
+TEACH = finder.TeachStore(os.path.join(os.path.dirname(os.path.abspath(__file__)), "taught"))
+CONF = finder.Confirmer()                    # a target counts after 3 of the last 5 looks agree
+MEMCONF = finder.Confirmer()                 # same, for memory writes
 GRID = None
 
 
@@ -257,11 +279,16 @@ def motors_for(angle, duty, hz):
 # ----------------------------------------------------------------- talking back
 def say(text):
     print("SAY:", text)
+    log_event("said", text)
     with S.lock:
         S.last_said = text
+    send_phone({"type": "say", "text": text})
+
+
+def send_phone(obj):
     ws, loop = PHONE["ws"], PHONE["loop"]
     if ws is not None and loop is not None:
-        asyncio.run_coroutine_threadsafe(ws.send_text(json.dumps({"type": "say", "text": text})), loop)
+        asyncio.run_coroutine_threadsafe(ws.send_text(json.dumps(obj)), loop)
 
 
 def say_hint(text, every):
@@ -463,8 +490,9 @@ class Brain:
         return out
 
     def find(self, frame, target, gemini_ok=True, background=False):
-        """local find-anything detector first; Gemini only if it finds nothing."""
-        items = LOCAL.detect(frame, [target]) if LOCAL is not None else []
+        """local detector first; Gemini only if it finds nothing. Items from the detector thread carry the
+        "meta" of the frame they were found in (use it for the position, not the newest meta)."""
+        items = local_find(frame, target)
         if items:
             with S.lock:
                 S.last_finder = f"YOLO-World ({items[0]['conf']:.2f})"
@@ -497,6 +525,42 @@ class Brain:
         except Exception as e:
             print("describe error:", e)
             return "I can't describe the scene right now."
+
+
+def local_find(frame, target, after_t=None):
+    """fixed-vocabulary detector thread (distractor-aware, taught items re-ranked); open-vocab for other words."""
+    if DET is None:
+        return LOCAL.detect(frame, [target]) if LOCAL is not None and LOCAL.model is not None else []
+    got = DET.wait_newer(after_t, 0.6) if after_t is not None else None
+    dets, meta, _, t, fr = got + (DET.frame,) if got is not None else DET.latest(with_frame=True)
+    if fr is None or time.time() - t > 1.0:
+        return []
+    if finder.canonical(target) or TEACH.has(target):
+        best = finder.pick_target(dets, target, TEACH, fr)
+        return [dict(best, meta=meta, label=target)] if best else []
+    try:
+        found = DET.det.detect_open(frame, target)
+    except Exception as e:
+        print("open-vocab error:", e)
+        return []
+    return sorted(found, key=lambda d: -d["conf"])[:1]
+
+
+def confirmed_find(frame, target, budget_s=0.8):
+    """for a spoken find: watch a few detector results and lock only on a confirmed sighting (or the best one
+    seen if time runs out), so a single wrong box doesn't send the wearer to the wrong object."""
+    CONF.reset(target)
+    end, best, t = time.time() + budget_s, None, time.time() - 0.01
+    while time.time() < end:
+        items = local_find(frame, target, after_t=t)
+        t = time.time()
+        if CONF.confirmed(target, items[0]["box"] if items else None, t) and items:
+            return items
+        if items and (best is None or items[0].get("score", items[0]["conf"]) > best[0].get("score", best[0]["conf"])):
+            best = items
+        if DET is None:
+            break
+    return best or []
 
 
 # ----------------------------------------------------------------- perception thread
@@ -542,6 +606,10 @@ class FloorMap:
         self.val = np.zeros((self.n, self.n), np.float32)      # >0 occupied evidence, <0 free evidence
         self.lock = threading.Lock()
         self.half = MAP_SIZE_M / 2
+
+    def reset(self):
+        with self.lock:
+            self.val[:] = 0
 
     def to_cell(self, p):
         return int((p[0] + self.half) / MAP_CELL_M), int((p[1] + self.half) / MAP_CELL_M)   # (col, row)
@@ -623,7 +691,7 @@ class FloorMap:
             c = came[c]
         return path[::-1]
 
-    def render(self, meta, path, target):
+    def render(self, meta, path, target, pins=()):
         with self.lock:
             v = self.val.copy()
         img = np.full((self.n, self.n, 3), 130, np.uint8)
@@ -636,13 +704,19 @@ class FloorMap:
             cv2.polylines(img, [np.array([px(p) for p in path], np.int32)], False, (0, 140, 255), 3)
         if target is not None:
             cv2.circle(img, px(target), 9, (40, 40, 220), -1)
+        for pin in pins:                                  # remembered objects
+            c = px((pin["x"], pin["z"]))
+            col = (150, 150, 150) if pin.get("stale") else (200, 90, 220)
+            cv2.drawMarker(img, c, col, cv2.MARKER_DIAMOND, 16, 3)
+            cv2.putText(img, pin["label"], (c[0] + 9, c[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 3)
+            cv2.putText(img, pin["label"], (c[0] + 9, c[1] - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
         if meta is not None:
             heading, _, pos = pose(meta)
             p = px(pos)
             tip = px(pos + 0.6 * np.array([math.sin(math.radians(heading)), -math.cos(math.radians(heading))]))
             cv2.circle(img, p, 8, (60, 200, 60), -1)
             cv2.line(img, p, tip, (60, 200, 60), 3)
-        cv2.putText(img, "black = obstacle, orange = route, red = goal, green = you", (10, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        cv2.putText(img, "black = obstacle, orange = route, red = goal, green = you, purple = memory", (10, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         return cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 75])[1].tobytes()
 
 
@@ -666,7 +740,7 @@ def planner_loop():
         with S.lock:
             S.path, S.path_t = path, time.time()
         if tracking_ok(meta):
-            S.map_vis = GRID.render(meta, path, tgt.get("pos") if tgt else None)
+            S.map_vis = GRID.render(meta, path, tgt.get("pos") if tgt else None, MEM.pins(time.time()))
 
 
 def route_bearing(meta, path):
@@ -718,17 +792,14 @@ def draw(frame, meta, dets, blocked, depth):
 def perception_loop():
     from ultralytics import YOLO
     model = YOLO(YOLO_ENGINE if os.path.exists(YOLO_ENGINE) else "yolo11n.pt", task="detect")
-    depth_pipe = None
+    worker = None
     if USE_DEPTH:
-        try:
-            import torch
-            from transformers import pipeline
-            depth_pipe = pipeline("depth-estimation", model=DEPTH_MODEL, device=0 if torch.cuda.is_available() else -1)
-            print("Depth model ready")
+        try:                                            # TensorRT engines if built, else HF fp16; own thread
+            worker = depth_trt.DepthWorker(depth_trt.make_depth(os.path.dirname(os.path.abspath(__file__))))
         except Exception as e:
             print("Depth model off:", e)
-    from PIL import Image
-    last_id, n, t0, depth = -1, 0, time.time(), None
+    last_id, n, t0, depth, dmeta = -1, 0, time.time(), None, None
+    ms = collections.defaultdict(float)
     while True:
         with S.lock:
             fid, frame, meta = S.frame_id, S.frame, S.meta
@@ -737,26 +808,37 @@ def perception_loop():
             time.sleep(0.005)
             continue
         last_id = fid
+        ta = time.time()
+        if worker is not None:
+            worker.submit(frame, meta, fid)             # never blocks; the worker keeps only the newest frame
+        if DET is not None:
+            DET.submit(frame, meta, fid)                # fixed-vocab YOLO-World, ~8 Hz, own thread
         res = model.track(frame, persist=True, verbose=False)[0]
         dets = []
         if res.boxes is not None and len(res.boxes):
             ids = res.boxes.id.int().tolist() if res.boxes.id is not None else [None] * len(res.boxes)
             for b, c, cf, i in zip(res.boxes.xyxy.tolist(), res.boxes.cls.int().tolist(), res.boxes.conf.tolist(), ids):
                 dets.append({"box": b, "name": model.names[c], "conf": cf, "id": i})
+        tb = time.time()
         source = "none"
         if pd is not None and time.time() - pdt < 0.5:
-            depth, source = pd, "LiDAR"
-        elif depth_pipe is not None:
-            if n % 2 == 0:
-                small = cv2.resize(frame, (320, 240))
-                d = depth_pipe(Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))["predicted_depth"]
-                depth = cv2.resize(d.squeeze().cpu().numpy().astype(np.float32), (W, H))
-            source = "estimated"
+            depth, dmeta, source = pd, meta, "LiDAR"
+        elif worker is not None:
+            got = worker.latest()
+            if got is not None and got[0].shape[:2] == frame.shape[:2]:
+                depth, dmeta, _, _, ms["depth_ms"] = got[0], got[1], got[2], got[3], got[4]
+                depth = scale_depth(depth, dmeta)
+                source = "estimated"
+            else:
+                depth = None
         else:
             depth = None
-        blocked, dist, cols = compute_sectors(depth, dets, meta)
-        if USE_PLANNER and GRID is not None and tracking_ok(meta):
-            GRID.update(meta, cols)
+        gmeta = dmeta if depth is not None and dmeta is not None else meta   # geometry uses the depth frame's pose
+        blocked, dist, cols = compute_sectors(depth, dets, gmeta)
+        tc = time.time()
+        if USE_PLANNER and GRID is not None and tracking_ok(gmeta):
+            GRID.update(gmeta, cols)
+        td = time.time()
         n += 1
         with S.lock:
             S.dets, S.depth, S.blocked, S.dist, S.depth_source = dets, depth, blocked, dist, source
@@ -765,6 +847,19 @@ def perception_loop():
         if n % 15 == 0:
             t0 = time.time()
         draw(frame, meta, dets, blocked, depth)
+        te = time.time()
+        for k, v in (("yolo_ms", tb - ta), ("sectors_ms", tc - tb), ("map_ms", td - tc), ("draw_ms", te - td)):
+            ms[k] = 0.9 * ms[k] + 100 * v                # EMA of milliseconds
+        if n % 5 == 0:
+            with S.lock:
+                S.timing = {k: round(v, 1) for k, v in ms.items()}
+        if n % 75 == 0:
+            print("timing:", {k: round(v, 1) for k, v in ms.items()}, f"fps {S.fps:.1f}")
+
+
+def scale_depth(depth, meta):
+    """hook for the per-frame metric scale correction (floor / ARKit feature points)."""
+    return depth
 
 
 # ----------------------------------------------------------------- modes and targets
@@ -799,14 +894,20 @@ def start_reach(tgt):
     say("It's right in front of you. Reach out, and the ring will guide your hand.")
 
 
-def start_find(target, walk_only=False):
+def start_find(target, walk_only=False, ask_first=False):
     own = "the" if walk_only else "your"
     frame, meta, depth = latest()
     if frame is None:
         say("I'm not getting any video yet.")
         return
-    items = BRAIN.find(frame, target)
+    if ask_first and recall(target):                   # a memory question: answer from memory even if not in view
+        items = []
+    else:
+        items = confirmed_find(frame, target)
+        if not items and BRAIN.client is not None:
+            items = BRAIN._boxes(frame, FIND_PROMPT.format(target=target))
     if items:
+        meta = items[0].get("meta") or meta
         tgt = lock_target(target, items[0]["box"], meta, depth, walk_only)
         rel = wrap(heading_to(pose(meta)[2], tgt["pos"])[0] - pose(meta)[0])
         if tgt["dist"] < REACH_M and not walk_only:
@@ -820,10 +921,17 @@ def start_find(target, walk_only=False):
     mem = recall(target)
     if mem:
         heading, _, pos = pose(meta)
+        if ask_first:                                   # "where did I leave...": answer, then offer to guide
+            set_mode("IDLE")
+            with S.lock:
+                S.pending = {"type": "goto", "target": target, "walk_only": walk_only, "expires": time.time() + 12}
+            say(MEM.describe(mem, heading, pos, time.time()) + " Want me to take you there?")
+            return
         rel = wrap(heading_to(pos, mem["pos"])[0] - heading)
         set_mode("GOTO", {"label": target, "pos": mem["pos"], "dist": None, "box": None, "in_view": False,
-                          "walk_only": walk_only})
-        say(f"I last saw {own} {target} {direction_words(rel)}, {int(time.time() - mem['t'])} seconds ago. Follow the belt.")
+                          "box_t": 0.0, "walk_only": walk_only})
+        say(MEM.describe(mem, heading, pos, time.time()) + " Follow the belt." if not walk_only
+            else f"I last saw {own} {target} {direction_words(rel)}. Follow the belt.")
         return
     set_mode("SEARCH", {"label": target, "pos": None, "box": None, "in_view": False, "walk_only": walk_only,
                         "started": time.time()})
@@ -856,15 +964,66 @@ def iou(a, b):
 
 
 def recall(target):
-    words = set(target.lower().split())
-    with S.lock:
-        hits = [(k, v) for k, v in S.memory.items() if words & set(k.split())]
-    return max(hits, key=lambda kv: kv[1]["t"])[1] if hits else None
+    return MEM.recall(target)
+
+
+YES_RE = re.compile(r"^\W*(yes|yeah|yep|yup|sure|ok(ay)?|please|go ahead|do it|take me|let'?s go)\b")
+NO_RE = re.compile(r"^\W*(no|nope|nah|cancel|never ?mind|not now|stop)\b")
+WHERE_RE = re.compile(r"\b(where|did i leave|did i put|last see|last saw)\b")
+
+
+TEACH_RE = re.compile(r"^\W*(?:this is|these are|here(?: is|'s| are)|remember this as|learn what|learn|memorize)\s+(?:my |the )?(.+?)(?: looks? like)?[.!?]*$")
+FORGET_RE = re.compile(r"^\W*forget (?:my |the |what )?(.+?)(?: looks? like)?[.!?]*$")
+
+
+def teach_item(label):
+    """'this is my wallet': store what the held item looks like from a few frames (CLIP), so finds prefer it."""
+    if not label or DET is None:
+        say("I can't learn items right now.")
+        return
+    say(f"Hold your {label} in front of the camera.")
+    n, t = 0, time.time()
+    for _ in range(4):
+        got = DET.wait_newer(t, 1.0)
+        if got is None:
+            continue
+        dets, meta, _, t = got
+        frame = DET.frame
+        wh = (frame.shape[1], frame.shape[0])
+        d = finder.pick_teach_box(dets, (meta or {}).get("hands"), wh)
+        box = d["box"] if d else finder.default_teach_box((meta or {}).get("hands"), wh)
+        try:
+            n = TEACH.teach(label, frame, box, det_class=d["label"] if d else None)
+        except Exception as e:
+            print("teach error:", e)
+            say("I couldn't learn that one. Is the image model installed?")
+            return
+        time.sleep(0.25)
+    say(f"Got it. I'll know your {label} now." if n else f"I couldn't see your {label}. Try again closer to the camera.")
 
 
 def handle_command(text):
     with S.lock:
         S.last_heard = text
+        pending, S.pending = S.pending, None
+    log_event("heard", text)
+    t = text.lower().strip()
+    if pending and time.time() < pending["expires"]:
+        if YES_RE.match(t):
+            start_find(pending["target"], pending.get("walk_only", False))
+            return
+        if NO_RE.match(t):
+            say("Okay.")
+            return
+    m = TEACH_RE.match(t)
+    if m:
+        teach_item(clean_target(m.group(1)))
+        return
+    m = FORGET_RE.match(t)
+    if m:
+        lab = clean_target(m.group(1))
+        say(f"Okay, I forgot what your {lab} looks like." if TEACH.forget(lab) else f"I hadn't learned your {lab}.")
+        return
     it = BRAIN.intent(text)
     intent, target = it.get("intent", ""), clean_target(it.get("target"))
     print(f"COMMAND {text!r} -> {intent} {target!r}")
@@ -883,7 +1042,7 @@ def handle_command(text):
     elif intent == "follow":
         start_follow(target)
     elif intent in ("find", "where"):
-        start_find(target or "keys")
+        start_find(target or "keys", ask_first=intent == "where" or bool(WHERE_RE.search(t)))
     elif intent == "goto":
         start_find(target or "door", walk_only=True)
     else:
@@ -1005,7 +1164,7 @@ def control_loop():
 def refresher_loop():
     """re-finds the current target so the box/position stay fresh (GOTO, SEARCH, REACH)."""
     while True:
-        local_ok = LOCAL is not None and LOCAL.model is not None
+        local_ok = DET is not None or (LOCAL is not None and LOCAL.model is not None)
         time.sleep(REFRESH_LOCAL_S if local_ok else REFRESH_GEMINI_S)
         if BRAIN is None or (BRAIN.client is None and not local_ok):
             continue
@@ -1023,11 +1182,16 @@ def refresher_loop():
         # Gemini only while searching or reaching; in GOTO the map already knows where the target is
         gemini_ok = (mode != "GOTO" or tgt.get("pos") is None) and time.time() - LAST["gemini"] > REFRESH_GEMINI_S
         items = BRAIN.find(frame, tgt["label"], gemini_ok=gemini_ok, background=True)
+        local = bool(items) and "meta" in items[0]
+        ok = CONF.confirmed(tgt["label"], items[0]["box"] if local else None, time.time())
+        if local and not ok:
+            items = []                                  # wait for 3-of-5 agreement before moving the target
         if not items:
             if mode == "SEARCH" and time.time() - tgt.get("started", time.time()) > 25:
                 say(f"I still can't find your {tgt['label']}. Stopping the search.")
                 set_mode("IDLE")
             continue
+        meta = items[0].get("meta") or meta
         new = lock_target(tgt["label"], items[0]["box"], meta, depth, tgt.get("walk_only", False))
         with S.lock:
             still = S.mode == mode and S.target is tgt
@@ -1047,34 +1211,54 @@ def refresher_loop():
 
 
 def memory_loop():
-    """logs where notable objects are, so 'where did I leave...' works later.
-    Local find-anything scan every few seconds; Gemini adds a smarter scan now and then."""
-    last_gemini, last_thumb = 0.0, None
+    """logs where notable objects are, so 'where did I leave...' works later. Reads the detector thread's
+    newest result twice a second (no extra GPU work); an object is written only after 3 of 5 looks agree.
+    Gemini adds a smarter scan now and then when the scene changed."""
+    last_gemini, last_thumb, last_t, last_neg = 0.0, None, 0.0, 0.0
     while True:
-        time.sleep(LOCAL_MEMORY_EVERY_S)
+        time.sleep(0.5 if DET is not None else LOCAL_MEMORY_EVERY_S)
         if BRAIN is None:
             continue
-        with S.lock:
-            mode = S.mode
-        if mode in ("REACH", "SEARCH"):
-            continue
-        frame, meta, depth = latest()
-        if frame is None:
-            continue
         items = []
-        if LOCAL is not None and LOCAL.model is not None:
-            items += LOCAL.detect(frame, MEMORY_CLASSES, conf=0.25)
+        if DET is not None:
+            dets, meta, _, t, frame = DET.latest(with_frame=True)
+            if frame is None or t <= last_t:
+                continue
+            last_t, depth = t, S.depth
+            found = {d["label"]: d for d in finder.memory_items(dets)}
+            for lab in finder.MEMORY_LABELS:
+                d = found.get(lab)
+                if MEMCONF.confirmed(lab, d["box"] if d else None, t) and d:
+                    items.append(d)
+        else:
+            frame, meta, depth = latest()
+            if frame is None:
+                continue
+            if LOCAL is not None and LOCAL.model is not None:
+                items += LOCAL.detect(frame, MEMORY_CLASSES, conf=0.25)
         if BRAIN.client is not None and MEMORY_EVERY_S > 0 and time.time() - last_gemini > MEMORY_EVERY_S:
             thumb = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (32, 24), interpolation=cv2.INTER_AREA)
             if last_thumb is None or np.abs(thumb.astype(np.int16) - last_thumb).mean() > 12:
                 last_gemini, last_thumb = time.time(), thumb.astype(np.int16)   # scene changed: worth a scan
                 items += BRAIN.scan(frame)
+        if not tracking_ok(meta):
+            continue                                   # positions are only trustworthy while ARKit tracks
+        heading, _, pos = pose(meta)
+        now, seen = time.time(), set()
         for it in items:
             if not it["label"]:
                 continue
             t = lock_target(it["label"], it["box"], meta, depth)
-            with S.lock:
-                S.memory[it["label"]] = {"pos": t["pos"], "t": time.time()}
+            x0, y0, x1, y1 = [int(v) for v in it["box"]]
+            crop = frame[max(0, y0):max(y0 + 1, y1), max(0, x0):max(x0 + 1, x1)]
+            thumb = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes() if crop.size else None
+            if MEM.add(it["label"], t["pos"], t.get("height"), it.get("conf", 1.0), cam_pos_xz=pos, t=now, thumb=thumb):
+                seen.add(it["label"])
+        if now - last_neg > 2.0:                       # "should be in view but isn't": 3 misses -> stale
+            last_neg, half_fov = now, abs(px_bearing(0, meta))
+            for pin in MEM.pins(now):
+                if pin["label"] not in seen:
+                    MEM.negative(pin["label"], pos, heading, half_fov, now)
 
 
 # ----------------------------------------------------------------- web: phone socket + dashboard
@@ -1165,7 +1349,83 @@ async def state():
             "heard": S.last_heard, "said": S.last_said, "target": tgt.get("label"), "finder": S.last_finder,
             "depth": S.depth_source, "phone": PHONE["ws"] is not None,
             "planner": ("route" if S.path else "dodge only") if USE_PLANNER else "off",
-            "memory": sorted([[k, int(time.time() - v["t"])] for k, v in S.memory.items()], key=lambda kv: kv[1])[:8]})
+            "timing": dict(S.timing, fps=round(S.fps, 1)), "depth_source": S.depth_source,
+            "depth_scale": round(S.depth_scale, 3), "pending": bool(S.pending),
+            "memory": [dict(p, thumb=p["label"] in MEM.thumbs) for p in MEM.pins(time.time())],
+            "taught": taught_list()})
+
+
+def taught_list():
+    try:
+        return [{"label": lab, "n": len(TEACH.items[lab]["emb"])} for lab in TEACH.labels()]
+    except Exception:
+        return [{"label": lab, "n": 1} for lab in TEACH.labels()]
+
+
+@app.get("/taught/{label}.jpg")
+async def taught_thumb(label: str):
+    path = os.path.join(TEACH.dir, finder._slug(TEACH.key(label)) + ".jpg")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404)
+    return Response(content=open(path, "rb").read(), media_type="image/jpeg")
+
+
+@app.get("/thumb/{label}.jpg")
+async def thumb(label: str):
+    jpg = MEM.thumbs.get(label)
+    if jpg is None:
+        raise HTTPException(status_code=404)
+    return Response(content=jpg, media_type="image/jpeg")
+
+
+@app.websocket("/ws/events")
+async def events(ws: WebSocket):
+    await ws.accept()
+    with EVENTS_LOCK:
+        hist = list(EVENTS)
+    last = hist[-1][0] if hist else 0
+    try:
+        await ws.send_text(json.dumps([{"i": i, "t": t, "who": w, "text": x} for i, t, w, x in hist]))
+        while True:
+            await asyncio.sleep(0.2)
+            with EVENTS_LOCK:
+                new = [e for e in EVENTS if e[0] > last]
+            for i, t, w, x in new:
+                await ws.send_text(json.dumps({"i": i, "t": t, "who": w, "text": x}))
+                last = i
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+
+
+def apply_setting(key, value):
+    """called by Settings when the dashboard changes something."""
+    global USE_PLANNER
+    if key == "planner":
+        USE_PLANNER = bool(value)
+    elif key == "camera":
+        send_phone({"type": "camera_mode", "zoom": value})   # the phone restarts ARKit: world coords reset
+        MEM.clear()
+        if GRID is not None:
+            GRID.reset()
+        set_mode("IDLE")
+        log_event("info", f"Camera set to {value}: tracking, map and memory reset")
+    elif key == "orient":
+        ORIENT["force"] = value
+
+
+SETTINGS = settings_mod.Settings(on_change=apply_setting)
+
+
+@app.get("/settings")
+async def get_settings():
+    return JSONResponse(SETTINGS.get())
+
+
+@app.post("/settings")
+async def post_settings(payload: dict = Body(...)):
+    results = [SETTINGS.set(k, v) for k, v in payload.items()]
+    ok = all(r[0] for r in results) if results else False
+    return {"ok": ok, "message": "; ".join(r[1] for r in results)}
 
 
 @app.post("/cmd")
@@ -1202,8 +1462,13 @@ async def text_to_speech(payload: dict = Body(...)):
     return Response(content=audio, media_type="audio/mpeg")
 
 
+DASHBOARD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+
+
 @app.get("/")
 async def index():
+    if os.path.exists(DASHBOARD_FILE):                   # judge dashboard; the built-in page is the fallback
+        return HTMLResponse(open(DASHBOARD_FILE, encoding="utf-8").read())
     return HTMLResponse(DASHBOARD_HTML)
 
 
@@ -1254,7 +1519,12 @@ setInterval(tick,200);belt({});
 
 if __name__ == "__main__":
     BELT = Belt()
-    LOCAL = LocalFinder()
+    try:                                                # fixed-vocab detector thread; old LocalFinder as fallback
+        DET = finder.DetectorThread(finder.WorldDetector())
+        print("Detector thread ready:", len(finder.VOCAB), "words")
+    except Exception as e:
+        print("Detector thread off, using the old finder:", e)
+        LOCAL = LocalFinder()
     BRAIN = Brain()
     GRID = FloorMap()
     for fn in (perception_loop, control_loop, refresher_loop, memory_loop, planner_loop):

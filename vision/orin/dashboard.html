@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Omnibelt</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#0b0d10;--panel:#14181d;--line:#262d36;--tx:#f2f5f8;--dim:#8d99a6;--acc:#ffb020;--blue:#3aa0ff;--ok:#38d27a;--bad:#ff5d5d;
+--font:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--tx);font:20px/1.35 var(--font)}
+header{display:flex;align-items:center;gap:18px;padding:14px 24px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+h1{margin:0;font-size:38px;letter-spacing:-.02em;font-weight:800}
+h1 span{color:var(--acc)}
+.badge{display:inline-flex;align-items:center;gap:10px;padding:6px 16px;border-radius:99px;font-weight:700;font-size:22px;border:2px solid var(--line);background:var(--panel)}
+.dot{width:14px;height:14px;border-radius:50%;background:var(--bad)}
+.badge.ok .dot{background:var(--ok);box-shadow:0 0 10px var(--ok)}
+.badge.ok{border-color:#1f6b45}
+#mode{letter-spacing:.08em;color:var(--bg);background:var(--dim);border-color:transparent}
+#mode.WALK,#mode.GOTO{background:var(--blue)}#mode.SEARCH,#mode.REACH{background:var(--acc)}#mode.FOLLOW{background:var(--ok)}
+#target{font-size:26px;font-weight:700;color:var(--acc)}
+#fps{margin-left:auto;font:700 28px var(--mono);color:var(--dim)}
+#fps b{color:var(--tx)}
+main{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);gap:18px;padding:18px 24px 28px;max-width:2200px;margin:0 auto}
+.col{display:grid;gap:18px;align-content:start;min-width:0}
+section{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px;min-width:0}
+h2{margin:0 0 12px;font-size:15px;text-transform:uppercase;letter-spacing:.14em;color:var(--dim);font-weight:700;display:flex;align-items:center;gap:12px}
+h2 .sp{margin-left:auto;display:flex;gap:6px}
+.vid{display:block;width:100%;border-radius:10px;background:#000;aspect-ratio:4/3;object-fit:contain;max-height:62vh}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.seg{display:inline-flex;border:2px solid var(--line);border-radius:10px;overflow:hidden}
+.seg button{font:700 19px var(--font);padding:9px 18px;background:transparent;color:var(--dim);border:0;border-left:2px solid var(--line);cursor:pointer}
+.seg button:first-child{border-left:0}
+.seg button.on{background:var(--acc);color:#111}
+.seg button:disabled{opacity:.4;cursor:not-allowed}
+.small .seg button{font-size:15px;padding:5px 12px}
+button.q{font:600 18px var(--font);padding:9px 16px;border-radius:10px;border:2px solid var(--line);background:#1b2128;color:var(--tx);cursor:pointer}
+button.q:hover,.seg button:hover:not(.on){border-color:var(--acc)}
+.setrow{display:flex;align-items:center;gap:14px;margin:10px 0;flex-wrap:wrap}
+.setrow label{width:140px;color:var(--dim);font-weight:600}
+.note{font-size:15px;color:var(--dim);margin:2px 0 0 154px}
+#setmsg{min-height:26px;font-weight:700;margin-top:8px}
+#setmsg.ok{color:var(--ok)}#setmsg.bad{color:var(--bad)}
+#log{height:380px;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding-right:6px;scroll-behavior:smooth}
+.msg{max-width:85%;padding:10px 16px;border-radius:18px;font-size:22px;word-wrap:break-word}
+.msg.heard{align-self:flex-start;background:#223044;border-bottom-left-radius:4px}
+.msg.said{align-self:flex-end;background:#3a2c0c;color:#ffd98a;border-bottom-right-radius:4px}
+.msg.info{align-self:center;background:transparent;color:var(--dim);font-size:16px;font-family:var(--mono)}
+.msg small{display:block;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.1em;margin-bottom:2px}
+.cmdrow{display:flex;gap:10px;margin-bottom:12px}
+input{flex:1;min-width:0;font:20px var(--font);padding:12px 16px;border-radius:10px;border:2px solid var(--line);background:#0e1216;color:var(--tx)}
+input:focus{outline:none;border-color:var(--acc)}
+.quick{display:flex;flex-wrap:wrap;gap:10px}
+#mem{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}
+.card{display:flex;gap:12px;background:#0e1216;border:1px solid var(--line);border-radius:10px;padding:10px;align-items:center;min-height:84px}
+.card img{width:72px;height:72px;object-fit:cover;border-radius:8px;background:#000;flex:none}
+.card b{font-size:22px;display:block}
+.card span{color:var(--dim);font-size:16px}
+.tag{display:inline-block;font-size:13px;font-weight:800;padding:2px 8px;border-radius:6px;margin:3px 4px 0 0;text-transform:uppercase;letter-spacing:.06em;color:#111}
+.tag.moved{background:var(--acc)}.tag.stale{background:var(--dim)}
+.empty{color:var(--dim);font-size:17px}
+#taught{display:flex;flex-wrap:wrap;gap:12px;margin-top:6px}
+.tcard{text-align:center;font-size:15px;color:var(--dim)}
+.tcard img{display:block;width:76px;height:76px;object-fit:cover;border-radius:8px;border:2px solid var(--line);background:#000}
+.bar{display:grid;grid-template-columns:110px 1fr 90px;gap:12px;align-items:center;margin:7px 0;font-size:18px}
+.bar i{display:block;height:16px;border-radius:8px;background:#0e1216;overflow:hidden}
+.bar i u{display:block;height:100%;background:var(--blue);border-radius:8px;transition:width .2s}
+.bar em{font:600 18px var(--mono);text-align:right;font-style:normal}
+#depthsrc{font:600 18px var(--mono);color:var(--dim);margin-top:8px}
+#belt{width:100%;max-width:340px;display:block;margin:0 auto}
+#info{font-size:19px;color:var(--dim);margin-top:6px}
+#info b{color:var(--tx)}
+@media (max-width:1100px){main{grid-template-columns:1fr}.two{grid-template-columns:1fr}}
+</style></head>
+<body>
+<header>
+<h1>Omni<span>belt</span></h1>
+<span id="phone" class="badge"><i class="dot"></i><span>phone</span></span>
+<span id="mode" class="badge">IDLE</span>
+<span id="target"></span>
+<span id="fps"><b>--</b> fps</span>
+</header>
+<main>
+<div class="col">
+<section>
+<h2>Vision <span class="sp seg" id="viewseg"><button data-v="camera" class="on">Camera</button><button data-v="depth">Depth</button></span></h2>
+<img id="cam" class="vid" src="/video/camera" alt="camera">
+</section>
+<section>
+<h2>Transcript</h2>
+<div id="log"></div>
+</section>
+<section>
+<h2>Command</h2>
+<div class="cmdrow"><input id="cmd" placeholder="Type a command, e.g. find my keys" autocomplete="off"><button class="q" id="send">Send</button></div>
+<div class="quick" id="quick"></div>
+</section>
+</div>
+<div class="col">
+<section>
+<h2>Floor map</h2>
+<img id="map" class="vid" src="/video/map" alt="floor map" style="aspect-ratio:1/1;max-height:50vh">
+</section>
+<div class="two">
+<section><h2>Belt</h2><svg id="belt" viewBox="-115 -115 230 230"></svg><div id="info"></div></section>
+<section><h2>Speed</h2><div id="speed"></div><div id="depthsrc"></div></section>
+</div>
+<section>
+<h2>Memory</h2>
+<div id="mem"><span class="empty">nothing remembered yet</span></div>
+<h2 style="margin-top:18px">Taught items</h2>
+<div id="taught"><span class="empty">none</span></div>
+</section>
+<section>
+<h2>Settings</h2>
+<div id="settings"></div>
+<div id="setmsg"></div>
+</section>
+</div>
+</main>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+const ANG={1:0,2:45,3:90,4:120,5:-120,6:-90,7:-45};
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// ---- view toggle (camera / depth) ----
+document.querySelectorAll('#viewseg button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#viewseg button').forEach(x=>x.classList.toggle('on',x===b));
+  $('cam').src='/video/'+b.dataset.v;
+});
+
+// ---- belt ring ----
+function belt(m){
+  m=m||{};
+  let s='<circle r="82" fill="none" stroke="#262d36" stroke-width="8"/><text y="-96" text-anchor="middle" fill="#8d99a6" font-size="13">FRONT</text>';
+  for(const k in ANG){
+    const a=ANG[k]*Math.PI/180,x=82*Math.sin(a),y=-82*Math.cos(a),on=m[k];
+    s+=`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${on?19:13}" fill="${on?'#3aa0ff':'#1b2128'}" stroke="${on?'#bfe0ff':'#33404d'}" stroke-width="2"/><text x="${x.toFixed(1)}" y="${(y+5).toFixed(1)}" text-anchor="middle" fill="${on?'#001a33':'#8d99a6'}" font-size="14" font-weight="700">${k}</text>`;
+  }
+  const r=m['8'];
+  s+=`<circle r="${r?30:22}" fill="${r?'#ffb020':'#1b2128'}" stroke="${r?'#ffe3a8':'#33404d'}" stroke-width="2"/><text y="5" text-anchor="middle" fill="${r?'#2a1a00':'#8d99a6'}" font-size="14" font-weight="700">ring</text>`;
+  $('belt').innerHTML=s;
+}
+
+// ---- state polling ----
+function ago(n){n=Math.round(+n||0);return n<60?n+'s':Math.floor(n/60)+'m '+(n%60)+'s';}
+function bars(t){
+  const keys=[['fps','FPS',60,''],['yolo_ms','YOLO',100,'ms'],['world_ms','World',100,'ms'],['depth_ms','Depth',100,'ms'],['map_ms','Map',100,'ms'],['draw_ms','Draw',100,'ms']];
+  let h='';
+  for(const [k,l,max,u] of keys){
+    if(t[k]==null)continue;
+    const v=+t[k]||0;
+    h+=`<div class="bar"><span>${l}</span><i><u style="width:${Math.min(100,v/max*100).toFixed(0)}%"></u></i><em>${v.toFixed(k==='fps'?1:0)}${u}</em></div>`;
+  }
+  return h||'<span class="empty">no timing</span>';
+}
+function memCards(mem){
+  if(!Array.isArray(mem)||!mem.length)return '<span class="empty">nothing remembered yet</span>';
+  return mem.map(m=>{
+    if(Array.isArray(m))m={label:m[0],age_s:m[1]}; // legacy [label, age]
+    const lab=m.label||'?',tags=(m.moved?'<span class="tag moved">moved</span>':'')+(m.stale?'<span class="tag stale">stale</span>':'');
+    return `<div class="card"><img src="/thumb/${encodeURIComponent(lab)}.jpg" alt="" onerror="this.style.display='none'"><div><b>${esc(lab)}</b><span>seen <span class="ag">${ago(m.age_s)}</span> ago</span><br>${tags}</div></div>`;
+  }).join('');
+}
+let taughtKey='';
+function taught(t){
+  if(!Array.isArray(t)||!t.length){if(taughtKey!=='-'){taughtKey='-';$('taught').innerHTML='<span class="empty">none</span>';}return;}
+  const key=JSON.stringify(t);if(key===taughtKey)return;taughtKey=key; // avoid reloading images each poll
+  $('taught').innerHTML=t.map(x=>{const l=x.label||'?';return `<div class="tcard"><img src="/taught/${encodeURIComponent(l)}.jpg" alt="" onerror="this.style.visibility='hidden'">${esc(l)}${x.n!=null?' ×'+esc(x.n):''}</div>`;}).join('');
+}
+let memKey='';
+async function tick(){
+  try{
+    const r=await fetch('/state',{cache:'no-store'});const s=await r.json();
+    belt(s.motors);
+    const ph=$('phone');ph.className='badge'+(s.phone?' ok':'');ph.lastChild.textContent=s.phone?'phone connected':'phone offline';
+    const mode=String(s.mode||'IDLE').toUpperCase();$('mode').textContent=mode;$('mode').className='badge '+mode;
+    $('target').textContent=s.target?'→ '+s.target:'';
+    $('fps').innerHTML='<b>'+(s.fps!=null?(+s.fps).toFixed(1):'--')+'</b> fps';
+    const t=s.timing||{};$('speed').innerHTML=bars(t);
+    const ds=[];if(s.depth_source||s.depth)ds.push(s.depth_source||s.depth);
+    $('depthsrc').textContent=(s.depth_scale!=null?'scale '+(+s.depth_scale).toFixed(2):'')+((s.depth_scale!=null&&ds.length)?' · ':'')+ds.join('');
+    const ml=(Array.isArray(s.memory)?s.memory:[]).map(m=>Array.isArray(m)?{label:m[0],age_s:m[1]}:m);
+    const mk=JSON.stringify(ml.map(m=>[m.label,m.moved,m.stale]));
+    if(mk!==memKey){memKey=mk;$('mem').innerHTML=memCards(ml);} // rebuild only on change so thumbnails do not flicker
+    $('mem').querySelectorAll('.ag').forEach((e,i)=>{if(ml[i])e.textContent=ago(ml[i].age_s);});
+    taught(s.taught);
+    $('info').innerHTML=[s.planner?'Path: <b>'+esc(s.planner)+'</b>':'',s.finder?'Found by: <b>'+esc(s.finder)+'</b>':''].filter(Boolean).join(' · ');
+  }catch(e){}
+}
+setInterval(tick,200);belt({});
+
+// ---- transcript over websocket ----
+let lastI=-1,ws=null,retry=500;
+function addMsg(m){
+  if(typeof m.i==='number'){if(m.i<=lastI)return;lastI=m.i;}
+  const log=$('log'),near=log.scrollHeight-log.scrollTop-log.clientHeight<80;
+  const who=m.who==='heard'||m.who==='said'?m.who:'info';
+  const d=document.createElement('div');d.className='msg '+who;
+  if(who!=='info'){const sm=document.createElement('small');sm.textContent=who==='heard'?'Heard':'Belt';d.appendChild(sm);}
+  d.appendChild(document.createTextNode(m.text||''));
+  log.appendChild(d);
+  while(log.children.length>200)log.removeChild(log.firstChild);
+  if(near)log.scrollTop=log.scrollHeight;
+}
+function connect(){
+  try{
+    ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/events');
+    ws.onopen=()=>{retry=500;};
+    ws.onmessage=e=>{try{const m=JSON.parse(e.data);if(Array.isArray(m))m.forEach(addMsg);else addMsg(m);}catch(x){}};
+    ws.onclose=()=>{setTimeout(connect,retry);retry=Math.min(5000,retry*1.6);};
+    ws.onerror=()=>{try{ws.close();}catch(x){}};
+  }catch(e){setTimeout(connect,2000);}
+}
+connect();
+
+// ---- commands ----
+async function sendCmd(text){
+  text=(text||'').trim();if(!text)return;
+  try{await fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});}catch(e){}
+}
+$('send').onclick=()=>{sendCmd($('cmd').value);$('cmd').value='';};
+$('cmd').onkeydown=e=>{if(e.key==='Enter'){sendCmd($('cmd').value);$('cmd').value='';}};
+for(const q of ['find my keys','where did I leave my keys','walk','stop','describe']){
+  const b=document.createElement('button');b.className='q';b.textContent=q;b.onclick=()=>sendCmd(q);$('quick').appendChild(b);
+}
+
+// ---- settings ----
+const DEF={camera:['1x','0.75x','0.5x'],power:['15W','MAXN SUPER'],planner:[true,false],orient:['auto','portrait','landscape']};
+const LABEL={camera:'Camera',power:'Power',planner:'Planner',orient:'Orientation'};
+const NOTE={camera:'changing lens resets tracking + memory'};
+let setTimer=null;
+const show=v=>typeof v==='boolean'?(v?'on':'off'):String(v);
+function renderSettings(g){
+  const opts=g.options||{};let h='';
+  for(const k of ['camera','power','planner','orient']){
+    let list=opts[k]||(k==='power'&&g.power_modes&&g.power_modes.length?g.power_modes:DEF[k]);
+    if(!list||!list.length)list=DEF[k];
+    const cur=g[k];
+    h+=`<div class="setrow"><label>${LABEL[k]}</label><span class="seg" data-k="${k}">`+list.map((v,i)=>`<button data-i="${i}" class="${v===cur?'on':''}">${esc(show(v))}</button>`).join('')+`</span></div>`;
+    if(NOTE[k])h+=`<div class="note">${NOTE[k]}</div>`;
+    $('settings').dataset['o'+k]=JSON.stringify(list);
+  }
+  if(g.dry_run)h+='<div class="note">power: dry-run (not a Jetson)</div>';
+  $('settings').innerHTML=h;
+  $('settings').querySelectorAll('.seg').forEach(seg=>{
+    const k=seg.dataset.k,list=JSON.parse($('settings').dataset['o'+k]);
+    seg.querySelectorAll('button').forEach(b=>b.onclick=()=>postSetting(k,list[+b.dataset.i]));
+  });
+}
+function flash(ok,msg){const m=$('setmsg');m.textContent=msg;m.className=ok?'ok':'bad';clearTimeout(setTimer);setTimer=setTimeout(()=>{m.textContent='';m.className='';},4000);}
+async function loadSettings(){
+  try{const g=await (await fetch('/settings',{cache:'no-store'})).json();renderSettings(g);}
+  catch(e){renderSettings({});}
+}
+async function postSetting(k,v){
+  try{
+    const r=await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({[k]:v})});
+    const j=await r.json();
+    flash(j.ok!==false,j.message||(j.ok===false?'failed':'ok'));
+  }catch(e){flash(false,'request failed');}
+  loadSettings();
+}
+loadSettings();
+</script>
+</body></html>

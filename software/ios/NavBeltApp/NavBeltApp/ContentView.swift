@@ -23,7 +23,27 @@ struct ContentView: View {
                     }
                 }
                 .font(.title).buttonStyle(.borderedProminent)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Camera").font(.subheadline).foregroundStyle(.secondary)
+                    Picker("Camera", selection: Binding(
+                        get: { streamer.profile },
+                        set: { streamer.setProfile($0) }
+                    )) {
+                        ForEach(CameraProfile.allCases) { p in
+                            Text(p.label).tag(p)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
                 Text(streamer.status).font(.headline).multilineTextAlignment(.center)
+                if !streamer.formatsInfo.isEmpty {
+                    DisclosureGroup("ARKit video formats") {
+                        Text(streamer.formatsInfo)
+                            .font(.caption2.monospaced())
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .font(.caption)
+                }
                 if streamer.running {
                     OrinCameraView(host: host)
                 }

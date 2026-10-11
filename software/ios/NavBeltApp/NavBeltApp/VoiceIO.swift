@@ -19,6 +19,9 @@ final class VoiceIO: NSObject, ObservableObject {
     private var active = false
     private var host = Config.defaultHost
     private weak var streamer: BeltStreamer?
+    /// Reply window: after the Orin asks a question, the next utterance is sent without the wake word.
+    private var replyUntil: Date?
+    private var replyTimer: Timer?
 
     private var player: AVAudioPlayer?
     private let synth = AVSpeechSynthesizer()
@@ -49,6 +52,9 @@ final class VoiceIO: NSObject, ObservableObject {
 
     func stop() {
         active = false
+        replyTimer?.invalidate()
+        replyTimer = nil
+        replyUntil = nil
         stopListening()
     }
 
@@ -75,6 +81,10 @@ final class VoiceIO: NSObject, ObservableObject {
                 if let result = result {
                     let text = result.bestTranscription.formattedString.lowercased()
                     self.lastHeard = text
+                    // Speech that starts inside the reply window keeps it open until the utterance finishes.
+                    if let until = self.replyUntil, Date() < until {
+                        self.replyUntil = max(until, Date().addingTimeInterval(2.5))
+                    }
                     self.debounce?.invalidate()
                     self.debounce = Timer.scheduledTimer(withTimeInterval: 1.2, repeats: false) { _ in
                         guard session == self.recognitionSession else { return }
@@ -121,25 +131,56 @@ final class VoiceIO: NSObject, ObservableObject {
             if !command.isEmpty {
                 streamer?.sendCommand(command)
                 lastHeard = "→ " + command
+                replyUntil = nil
             }
+        } else if let until = replyUntil, Date() < until, !trimmed.isEmpty, !isEcho(trimmed) {
+            streamer?.sendCommand(trimmed)          // e.g. "yes" / "no" right after a question
+            lastHeard = "↩ " + trimmed
+            replyUntil = nil
         }
         listen()                                    // fresh task, so old words aren't re-sent
+    }
+
+    /// True if the transcript is just our own spoken question picked up by the mic.
+    private func isEcho(_ heard: String) -> Bool {
+        func norm(_ s: String) -> String {
+            s.lowercased().components(separatedBy: CharacterSet.alphanumerics.union(.whitespaces).inverted).joined()
+        }
+        let h = norm(heard).trimmingCharacters(in: .whitespaces)
+        return h.count > 6 && norm(lastSaid).contains(h)
+    }
+
+    /// Opens the reply window once our question has finished playing, with a fresh recognition task.
+    private func openReplyWindow(after delay: TimeInterval) {
+        replyTimer?.invalidate()
+        replyTimer = Timer.scheduledTimer(withTimeInterval: max(0.1, delay), repeats: false) { [weak self] _ in
+            guard let self, self.active else { return }
+            self.replyUntil = Date().addingTimeInterval(Config.replyWindowSeconds)
+            self.listen()
+        }
     }
 
     // MARK: - Speaking
     func say(_ text: String) {
         lastSaid = text
-        if let data = cache[text.lowercased()] { play(data); return }
+        let question = text.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("?")
+        if let data = cache[text.lowercased()] { play(data, question: question); return }
         fetch(text) { data in
             DispatchQueue.main.async {
-                if let d = data { self.play(d) } else { self.synth.speak(AVSpeechUtterance(string: text)) }
+                if let d = data {
+                    self.play(d, question: question)
+                } else {
+                    self.synth.speak(AVSpeechUtterance(string: text))
+                    if question { self.openReplyWindow(after: Double(text.count) / 14.0 + 0.5) }   // rough speech length
+                }
             }
         }
     }
 
-    private func play(_ data: Data) {
+    private func play(_ data: Data, question: Bool = false) {
         player = try? AVAudioPlayer(data: data)
         player?.play()
+        if question { openReplyWindow(after: (player?.duration ?? 2) + 0.3) }
     }
 
     private func fetch(_ text: String, completion: @escaping (Data?) -> Void) {
