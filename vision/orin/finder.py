@@ -16,8 +16,10 @@ import numpy as np
 import cv2
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ENGINE_PATH = os.path.join(HERE, "yolow_vocab.engine")
-VOCAB_PT = os.path.join(HERE, "yolow_vocab.pt")
+MODEL = os.environ.get("FINDER_MODEL", "yolov8l-worldv2.pt")   # L: much better zero-shot than S; S if too slow
+_STEM = os.path.splitext(os.path.basename(MODEL))[0]
+ENGINE_PATH = os.path.join(HERE, f"yolow_vocab_{_STEM}.engine")  # named per model: an old S engine is never reused
+VOCAB_PT = os.path.join(HERE, f"yolow_vocab_{_STEM}.pt")
 
 DEMO = ["keys", "wallet", "water bottle"]
 MEMORY = ["glasses", "cup", "backpack", "bag", "laptop", "door", "chair"]
@@ -106,7 +108,7 @@ def _parse(r, names):
 
 class WorldDetector:
     """YOLO-World with one fixed vocabulary (no set_classes churn). detect(frame) -> [{label, box, conf}]."""
-    def __init__(self, model_path="yolov8s-worldv2.pt", conf=0.10, imgsz=640, model=None, engine=None):
+    def __init__(self, model_path=MODEL, conf=0.10, imgsz=640, model=None, engine=None):
         self.model_path, self.conf, self.imgsz = model_path, conf, imgsz
         self.vocab, self.lock, self.engine = list(VOCAB), threading.Lock(), False
         self.open_model, self.open_cls, self.open_lock = None, None, threading.Lock()
@@ -159,7 +161,7 @@ class WorldDetector:
         return [dict(d, label=target) for d in _parse(r, [target])]
 
 
-def export_engine(model_path="yolov8s-worldv2.pt", imgsz=640):
+def export_engine(model_path=MODEL, imgsz=640):
     from ultralytics import YOLO, YOLOWorld
     m = YOLOWorld(model_path)
     m.set_classes(list(VOCAB))
@@ -465,6 +467,6 @@ def default_teach_box(hands, frame_wh):
 if __name__ == "__main__":
     import sys
     if sys.argv[1:2] == ["export"]:
-        export_engine(sys.argv[2] if len(sys.argv) > 2 else "yolov8s-worldv2.pt")
+        export_engine(sys.argv[2] if len(sys.argv) > 2 else MODEL)
     else:
-        print("usage: python3 finder.py export [yolov8s-worldv2.pt]")
+        print("usage: python3 finder.py export [yolov8l-worldv2.pt]")

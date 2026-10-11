@@ -91,7 +91,7 @@ BODY_RADIUS_M = 0.35       # keep the route this far from obstacles
 LOOKAHEAD_M = 0.8          # steer toward the point this far along the route
 OBST_MIN_H, OBST_MAX_H = 0.15, 1.9   # only things between ankle and head height count as obstacles
 RING = 8
-VERSION = "nav-accuracy w6"
+VERSION = "nav-accuracy w7"
 FIELD = {"mirror_belt": False, "mirror_hands": False, "voice": "quiet"}   # dashboard switches
 ORIENT = {"force": os.environ.get("ORIENT", "auto"), "k": 0}   # auto | portrait | landscape; k = current rotation
 W, H = 640, 480
@@ -635,6 +635,7 @@ def tile_detect(frame):
 
 
 EXIT_WORDS = ("exit", "exit door", "way out", "emergency exit", "the exit")
+LEARNED_SIM = float(os.environ.get("LEARNED_SIM", "0.72"))   # how alike a crop must be to an auto-learned item
 WHERE_CLAUSE = re.compile(r"\s+(?:on|in|at|near|by|under|next to|beside|behind|inside|over|from)\s+(?:the|a|my|this|that)?\s*\S.*$")
 
 
@@ -657,7 +658,7 @@ def local_find(frame, target, after_t=None, zoom=False):
     dets, meta, _, t, fr = got + (DET.frame,) if got is not None else DET.latest(with_frame=True)
     if fr is None or time.time() - t > 1.0:
         return []
-    if finder.canonical(target) or TEACH.has(target):
+    if finder.canonical(target) or (TEACH.has(target) and TEACH.classes(target)):   # vocabulary / taught-by-hand
         best = finder.pick_target(dets, target, TEACH, fr)
         if best is None and zoom:
             best = finder.pick_target(tile_detect(fr), target, TEACH, fr)   # small item: look again, zoomed in
@@ -667,6 +668,20 @@ def local_find(frame, target, after_t=None, zoom=False):
             doors = [d for d in dets if d["label"] == "door"]
             best = max(doors, key=lambda d: (d["box"][2] - d["box"][0]) * (d["box"][3] - d["box"][1]), default=best)
         return [dict(best, meta=meta, label=target)] if best else []
+    if TEACH.has(target):                                # learned from a Gemini find: match its look
+        props = list(dets)
+        for q in open_queries(target):
+            try:
+                props += DET.det.detect_open(fr, q, conf=0.08)
+            except Exception as e:
+                print("open-vocab error:", e)
+        props = [d for d in props if (d["box"][2] - d["box"][0]) * (d["box"][3] - d["box"][1]) < 0.5 * fr.shape[0] * fr.shape[1]]
+        if props:
+            sims = TEACH.similarity_boxes(target, fr, [d["box"] for d in props])
+            i = int(np.argmax(sims))
+            if sims[i] >= LEARNED_SIM:
+                return [dict(props[i], meta=meta, label=target, sim=sims[i])]
+        return []
     found = []
     for q in open_queries(target):                       # most specific first, then the plain noun
         try:
@@ -1045,7 +1060,22 @@ def start_reach(tgt):
     say("It's right in front of you. Reach out, and the ring will guide your hand.")
 
 
-def start_find(target, walk_only=False, ask_first=False):
+def gemini_online():
+    return BRAIN.client is not None and time.time() > getattr(BRAIN, "paused_until", 0)
+
+
+def auto_learn(target, frame, box):
+    """remember what Gemini's find looks like, so local tracking follows that exact object from now on."""
+    if not TEACH_STATE["ready"]:
+        return
+    try:
+        TEACH.teach(target, frame, box)
+        log_event("info", f"Learned what your {target} looks like")
+    except Exception as e:
+        print("auto-learn failed:", e)
+
+
+def start_find(target, walk_only=False, ask_first=False, desc=None):
     own = "the" if walk_only else "your"
     frame, meta, depth = latest()
     if frame is None:
@@ -1054,9 +1084,19 @@ def start_find(target, walk_only=False, ask_first=False):
     if ask_first and recall(target):                   # a memory question: answer from memory even if not in view
         items = []
     else:
-        items = confirmed_find(frame, target)
-        if not items and BRAIN.client is not None:
-            items = BRAIN._boxes(frame, FIND_PROMPT.format(target=target), models=BRAIN.models + BRAIN.light)
+        unusual = not finder.canonical(target) and not TEACH.has(target) and target not in EXIT_WORDS
+        items = []
+        if unusual and gemini_online():                  # Gemini knows "green dragon"; the local model may not
+            say(f"Looking for {own} {target}.")
+            items = BRAIN._boxes(frame, FIND_PROMPT.format(target=desc or target), models=BRAIN.models + BRAIN.light)
+            if items:
+                with S.lock:
+                    S.last_finder = "Gemini"
+                threading.Thread(target=auto_learn, args=(target, frame.copy(), items[0]["box"]), daemon=True).start()
+        if not items:
+            items = confirmed_find(frame, target)
+        if not items and not unusual and gemini_online():
+            items = BRAIN._boxes(frame, FIND_PROMPT.format(target=desc or target), models=BRAIN.models + BRAIN.light)
     if items:
         meta = items[0].get("meta") or meta
         tgt = lock_target(target, items[0]["box"], meta, depth, walk_only)
@@ -1288,11 +1328,11 @@ def handle_command(text):
     elif intent == "follow":
         start_follow(target)
     elif intent in ("find", "where"):
-        target = WHERE_CLAUSE.sub("", target).strip() or target    # "green dragon on the desk" -> "green dragon"
+        desc, target = target, WHERE_CLAUSE.sub("", target).strip() or target   # "green dragon on the desk" -> "green dragon"
         if target in EXIT_WORDS or finder.canonical(target) == "door":
             start_find(target, walk_only=True)                     # places: walk there, no reach
             return
-        start_find(target or "keys", ask_first=intent == "where" or bool(WHERE_RE.search(t)))
+        start_find(target or "keys", ask_first=intent == "where" or bool(WHERE_RE.search(t)), desc=desc)
     elif intent == "goto":
         start_find(target or "door", walk_only=True)
     else:

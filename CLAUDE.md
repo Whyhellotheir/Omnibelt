@@ -230,7 +230,7 @@ Firmware safety limits:
 
 **Orin setup (once, on good Wi-Fi)**, run from `vision/orin/`:
 1. `pip install git+https://github.com/ultralytics/CLIP.git ftfy regex`
-2. `python3 finder.py export`: builds `yolow_vocab.engine`. Re-run if `VOCAB` changes; `FINDER_ENGINE=0` ignores the engine.
+2. `python3 finder.py export`: builds `yolow_vocab_yolov8l-worldv2.engine`. The first run downloads the L model (~90 MB), so do it on good Wi-Fi. Re-run it if `VOCAB` changes. `FINDER_MODEL=yolov8s-worldv2.pt` falls back to the smaller, faster model, and `FINDER_ENGINE=0` ignores the engine.
 3. Depth engines: follow `vision/tests/DEPTH_ENGINE.md` (export the ONNX, then `trtexec --fp16` for 252x336 and 336x252). Without the engines it falls back to HF fp16 in a thread.
 4. Power switching from the dashboard: run `sudo visudo -f /etc/sudoers.d/omnibelt` and add `<user> ALL=(root) NOPASSWD: /usr/sbin/nvpmodel`. Then `sudo chmod 440 /etc/sudoers.d/omnibelt`. Check the modes with `sudo nvpmodel -q`.
 5. Settings: `ORIENT=auto|portrait|landscape` (dashboard too), `CAM_HEIGHT_M` = the measured lens height.
@@ -275,3 +275,4 @@ After checkpoint 3: freeze, rehearse the 90 s demo five times, and record a back
 - 2026-10-10: Added the belt assembly plan from the claude.ai chat (order, % spacing, 16-piece wiring, fit fixes). The CAD-width check found the battery and Orin overlap under ~110 cm waist; rule: butt battery/Orin/hub together on the spine.
 - 2026-10-11: `nav-accuracy` branch. Six parallel module builds (geometry, depth engine, finder + teach, memory, dashboard + settings, iOS), wired into the server. Found and fixed a pixel-based confirmation bug that stopped target updates while walking; it now confirms in world space. Simulated table approach: reach fires at 0.67–0.72 m. Portrait frames are rotated through `/stream`; floor and backpack checks unchanged. iOS is not compiled yet (Helena).
 - 2026-10-11: Real-life feedback, wave 3. Item teaching now loads its model at startup (it used to hang on the first "this is my"). Wake word is "Belt", with vocabulary hints, a listening click, end-of-speech that adapts to the sentence, no self-triggers, and Orin-side correction of misheard words. Reach also fires on a hand near the item, the item low and large in frame, or "Belt, reach". Zoomed crops find small items. Version string shown in /state.
+- 2026-10-11: w4–w7. Find me a seat, quiet voice, offline answers, exits/doors, mirror switches, 0.75x default, auto-stop and instant stop, steadier long-range targets, horizon zoom, 960x720 frames, YOLO-World L by default. For unusual items, Gemini finds first and the crop is auto-learned, then tracked locally.
