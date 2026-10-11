@@ -39,6 +39,7 @@ import memory as memory_mod
 import settings as settings_mod
 import depth_trt
 import finder
+import geometry
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, Response
@@ -140,6 +141,7 @@ class State:
         self.cols = None          # per-column nearest obstacle distance (64 columns), for the map
         self.timing = {}          # ms per stage + fps, for the dashboard
         self.depth_scale = 1.0
+        self.planes = []          # ARKit horizontal planes from the phone (world coords)
         self.pending = None       # {"type": "goto", "target": label, "expires": t} after "Want me to take you there?"
 
 
@@ -161,8 +163,33 @@ BRAIN = None
 LOCAL = None
 DET = None                                   # finder.DetectorThread: fixed-vocab YOLO-World on the newest frame
 TEACH = finder.TeachStore(os.path.join(os.path.dirname(os.path.abspath(__file__)), "taught"))
-CONF = finder.Confirmer()                    # a target counts after 3 of the last 5 looks agree
-MEMCONF = finder.Confirmer()                 # same, for memory writes
+
+
+class WorldConfirmer:
+    """a sighting counts after `need` of the last `n` looks put the object within `radius_m` of the same world
+    spot. World space (not pixels) so it keeps working while the wearer walks or turns."""
+    def __init__(self, n=5, need=3, radius_m=0.5, max_age=2.5):
+        self.n, self.need, self.r, self.max_age, self.hist = n, need, radius_m, max_age, {}
+        self.lock = threading.Lock()
+
+    def confirmed(self, label, pos, now):
+        with self.lock:
+            h = self.hist.setdefault(label, collections.deque(maxlen=self.n))
+            h.append((now, None if pos is None else np.asarray(pos, float)))
+            if pos is None:
+                return False
+            return sum(1 for t, q in h if q is not None and now - t <= self.max_age
+                       and np.hypot(*(q - h[-1][1])) <= self.r) >= self.need
+
+    def reset(self, label=None):
+        with self.lock:
+            self.hist.clear() if label is None else self.hist.pop(label, None)
+
+
+CONF = WorldConfirmer()                      # a target counts after 3 of the last 5 looks agree (in world space)
+DEPTH_SCALE = geometry.DepthScale()          # pins the depth model to real metres (ARKit points, else the floor)
+REACH_GATE = geometry.ReachGate(reach_m=0.75)   # belt -> ring hand-over at arm's length
+ROTCV = {1: cv2.ROTATE_90_CLOCKWISE, 2: cv2.ROTATE_180, 3: cv2.ROTATE_90_COUNTERCLOCKWISE}
 GRID = None
 
 
@@ -554,7 +581,8 @@ def confirmed_find(frame, target, budget_s=0.8):
     while time.time() < end:
         items = local_find(frame, target, after_t=t)
         t = time.time()
-        if CONF.confirmed(target, items[0]["box"] if items else None, t) and items:
+        pos = lock_target(target, items[0]["box"], items[0].get("meta") or S.meta, S.depth)["pos"] if items else None
+        if CONF.confirmed(target, pos, t) and items:
             return items
         if items and (best is None or items[0].get("score", items[0]["conf"]) > best[0].get("score", best[0]["conf"])):
             best = items
@@ -570,25 +598,15 @@ N_COLS = 64
 def obstacle_columns(depth, dets, meta):
     """nearest obstacle distance in each of 64 image columns. With depth, only points between ankle and
     head height count (so the floor never shows up as a wall). Without depth, YOLO box bottoms are used."""
-    cols = np.full(N_COLS, 9.9, np.float32)
     if depth is not None:
-        _, fy, _, cy = cam(meta)
-        pitch = pose(meta)[1]
-        rows = np.arange(0, H, 4)
-        p = math.radians(pitch)
-        up = math.sin(p) + (cy - rows) / fy * math.cos(p)    # height gained per metre of camera depth, per row (exact pinhole)
-        d = depth[rows][:, :N_COLS * (W // N_COLS)].reshape(len(rows), N_COLS, W // N_COLS).min(axis=2)
-        height = CAM_HEIGHT_M + d * up[:, None]
-        ok = (height > OBST_MIN_H) & (height < OBST_MAX_H) & (d > 0.2)
-        ahead = d * (math.cos(p) - (cy - rows) / fy * math.sin(p))[:, None]   # level distance along the floor
-        dd = np.where(ok, ahead, 9.9)
-        cols = np.percentile(dd, 5, axis=0).astype(np.float32)
-    else:
-        for det in dets:
-            x0, y0, x1, y1 = det["box"]
-            dist = floor_dist(y1, meta) if y1 < H - 3 else 0.8
-            c0, c1 = max(0, int(x0 * N_COLS / W)), min(N_COLS - 1, int(x1 * N_COLS / W))
-            cols[c0:c1 + 1] = np.minimum(cols[c0:c1 + 1], dist)
+        return geometry.obstacle_columns_any(depth, meta, CAM_HEIGHT_M, N_COLS, (OBST_MIN_H, OBST_MAX_H),
+                                             flip=FLIP_IMAGE)
+    cols = np.full(N_COLS, 9.9, np.float32)
+    for det in dets:
+        x0, y0, x1, y1 = det["box"]
+        dist = floor_dist(y1, meta) if y1 < H - 3 else 0.8
+        c0, c1 = max(0, int(x0 * N_COLS / W)), min(N_COLS - 1, int(x1 * N_COLS / W))
+        cols[c0:c1 + 1] = np.minimum(cols[c0:c1 + 1], dist)
     return cols
 
 
@@ -828,7 +846,7 @@ def perception_loop():
             if got is not None and got[0].shape[:2] == frame.shape[:2]:
                 depth, dmeta, _, _, ms["depth_ms"] = got[0], got[1], got[2], got[3], got[4]
                 depth = scale_depth(depth, dmeta)
-                source = "estimated"
+                source = "estimated, scale %.2f (%s)" % (DEPTH_SCALE.scale, DEPTH_SCALE.source or "none")
             else:
                 depth = None
         else:
@@ -858,8 +876,12 @@ def perception_loop():
 
 
 def scale_depth(depth, meta):
-    """hook for the per-frame metric scale correction (floor / ARKit feature points)."""
-    return depth
+    """per-frame metric scale correction: ARKit feature points when the phone sends them, else the floor."""
+    if tracking_ok(meta):
+        DEPTH_SCALE.update(depth, meta, CAM_HEIGHT_M)
+    with S.lock:
+        S.depth_scale = DEPTH_SCALE.scale
+    return DEPTH_SCALE.apply(depth)
 
 
 # ----------------------------------------------------------------- modes and targets
@@ -868,6 +890,7 @@ def set_mode(mode, target=None, keep_target=False):
         S.mode = mode
         if not keep_target:
             S.target = target
+    REACH_GATE.reset()
     if mode == "IDLE":
         BELT.set({})
 
@@ -879,11 +902,13 @@ def latest():
 
 def lock_target(label, box, meta, depth, walk_only=False):
     heading, pitch, pos = pose(meta)
-    cx = (box[0] + box[2]) / 2
-    world_h = heading + px_bearing(cx, meta)
-    dist = box_distance(box, meta, depth)
-    tpos = pos + dist * np.array([math.sin(math.radians(world_h)), -math.cos(math.radians(world_h))])
-    return {"label": label, "pos": tpos, "dist": dist, "box": box, "box_heading": heading, "box_pitch": pitch,
+    if depth is not None and depth.shape[:2] != (int(meta.get("H", H)), int(meta.get("W", W))):
+        depth = None                                     # depth from the other orientation: don't mix
+    with S.lock:
+        planes = list(S.planes)
+    est = geometry.target_estimate(box, meta, depth, CAM_HEIGHT_M, planes or None, flip=FLIP_IMAGE)
+    return {"label": label, "pos": np.array(est["pos_xz"], float), "dist": est["dist"], "height": est["height"],
+            "dist_source": est["source"], "box": box, "box_heading": heading, "box_pitch": pitch,
             "box_t": time.time(), "in_view": True, "walk_only": walk_only}
 
 
@@ -910,7 +935,7 @@ def start_find(target, walk_only=False, ask_first=False):
         meta = items[0].get("meta") or meta
         tgt = lock_target(target, items[0]["box"], meta, depth, walk_only)
         rel = wrap(heading_to(pose(meta)[2], tgt["pos"])[0] - pose(meta)[0])
-        if tgt["dist"] < REACH_M and not walk_only:
+        if tgt["dist"] < REACH_GATE.reach_m and tgt.get("dist_source") != "floor-guess" and not walk_only:
             start_reach(tgt)
             return
         set_mode("GOTO", tgt)
@@ -1109,10 +1134,15 @@ def control_loop():
         if meta is None or mode == "IDLE":
             BELT.set({})
             continue
+        heading, pitch, pos = pose(meta)
         if mode == "REACH":
+            d = heading_to(pos, tgt["pos"])[1] if tgt and tgt.get("pos") is not None else None
+            if REACH_GATE.should_exit(tgt, d, time.time()):
+                set_mode("GOTO", tgt)                     # lost it and walked away: back to the belt
+                say("Let's get a little closer. Follow the belt.")
+                continue
             reach_step(meta, tgt, meta.get("hands", []))
             continue
-        heading, pitch, pos = pose(meta)
         goal, gdist = 0.0, None
         if mode in ("GOTO", "SEARCH"):
             if not tgt or tgt.get("pos") is None:
@@ -1134,14 +1164,16 @@ def control_loop():
             if gdist < 1.2:
                 BELT.set({})
                 continue
-        if mode == "GOTO" and gdist is not None and gdist < REACH_M:
-            if tgt.get("walk_only"):
-                BELT.pattern("ARRIVE")
-                say(f"You're at the {tgt['label']}.")
-                set_mode("IDLE")
-            elif tgt.get("in_view"):
-                start_reach(tgt)
+        if mode == "GOTO" and gdist is not None and tgt.get("walk_only") and gdist < REACH_M:
+            BELT.pattern("ARRIVE")
+            say(f"You're at the {tgt['label']}.")
+            set_mode("IDLE")
             continue
+        if mode == "GOTO" and gdist is not None and not tgt.get("walk_only"):
+            gd = gdist if tgt.get("dist_source") != "floor-guess" else None   # table items: trust only the box size
+            if REACH_GATE.update(tgt, gd, tgt.get("box"), H, time.time()):
+                start_reach(tgt)
+                continue
         steer, near = goal, 9.9
         half_fov = abs(px_bearing(0, meta))
         if abs(goal) < half_fov:
@@ -1183,9 +1215,14 @@ def refresher_loop():
         gemini_ok = (mode != "GOTO" or tgt.get("pos") is None) and time.time() - LAST["gemini"] > REFRESH_GEMINI_S
         items = BRAIN.find(frame, tgt["label"], gemini_ok=gemini_ok, background=True)
         local = bool(items) and "meta" in items[0]
-        ok = CONF.confirmed(tgt["label"], items[0]["box"] if local else None, time.time())
-        if local and not ok:
-            items = []                                  # wait for 3-of-5 agreement before moving the target
+        if local:
+            cand = lock_target(tgt["label"], items[0]["box"], items[0]["meta"], depth, tgt.get("walk_only", False))
+            ok = CONF.confirmed(tgt["label"], cand["pos"], time.time())
+            near = tgt.get("pos") is not None and np.hypot(*(cand["pos"] - tgt["pos"])) < 0.8
+            if not (ok or (mode != "SEARCH" and near)):
+                items = []                              # a new spot needs 3-of-5 agreement; the known spot doesn't
+        else:
+            CONF.confirmed(tgt["label"], None, time.time())
         if not items:
             if mode == "SEARCH" and time.time() - tgt.get("started", time.time()) > 25:
                 say(f"I still can't find your {tgt['label']}. Stopping the search.")
@@ -1225,11 +1262,7 @@ def memory_loop():
             if frame is None or t <= last_t:
                 continue
             last_t, depth = t, S.depth
-            found = {d["label"]: d for d in finder.memory_items(dets)}
-            for lab in finder.MEMORY_LABELS:
-                d = found.get(lab)
-                if MEMCONF.confirmed(lab, d["box"] if d else None, t) and d:
-                    items.append(d)
+            items = list({d["label"]: d for d in finder.memory_items(dets)}.values())   # Memory confirms by place
         else:
             frame, meta, depth = latest()
             if frame is None:
@@ -1270,7 +1303,7 @@ async def stream(ws: WebSocket):
     await ws.accept()
     PHONE["ws"], PHONE["loop"] = ws, asyncio.get_running_loop()
     print("Phone connected")
-    meta, expect = None, None
+    meta, expect, frame_k = None, None, 0
     try:
         while True:
             msg = await ws.receive()
@@ -1282,28 +1315,42 @@ async def stream(ws: WebSocket):
                     meta, expect = data, "jpeg"
                 elif data.get("type") == "cmd":
                     threading.Thread(target=handle_command, args=(data.get("text", ""),), daemon=True).start()
+                elif data.get("type") == "planes":
+                    with S.lock:
+                        S.planes = [pl for pl in data.get("planes", []) if pl.get("T") and pl.get("poly")]
             elif msg.get("bytes") is not None and meta is not None:
                 b = msg["bytes"]
                 if expect == "jpeg":
                     img = cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_COLOR)
                     if img is None:
                         continue
-                    if img.shape[1] != W or img.shape[0] != H:
-                        img = cv2.resize(img, (W, H))
                     m = json.loads(json.dumps(meta))
-                    if FLIP_IMAGE:
+                    frame_k = 0
+                    if "rot" not in m and m.get("T"):    # phone didn't rotate: make the image upright here
+                        force = ORIENT["force"]
+                        if force == "auto":
+                            frame_k = geometry.pick_orientation(m["T"], ORIENT["k"])
+                        else:
+                            frame_k = 1 if force == "portrait" else 0
+                        ORIENT["k"] = frame_k
+                        img, m = geometry.apply_rotation(img, m, frame_k)
+                    elif FLIP_IMAGE:
                         img = cv2.rotate(img, cv2.ROTATE_180)
                         for hd in m.get("hands", []):
-                            for k in ("wrist", "index"):
+                            for k in ("wrist", "thumb", "index", "middle", "ring", "little"):
                                 if hd.get(k):
-                                    hd[k] = [W - hd[k][0], H - hd[k][1]]
+                                    hd[k] = [img.shape[1] - hd[k][0], img.shape[0] - hd[k][1]]
+                    set_frame_size(img.shape[1], img.shape[0])
+                    m["W"], m["H"] = img.shape[1], img.shape[0]
                     with S.lock:
                         S.frame, S.meta, S.frame_id = img, m, S.frame_id + 1
                     expect = "depth" if meta.get("depth") else None
                 elif expect == "depth":
                     d = np.frombuffer(b, np.float16).astype(np.float32).reshape(meta.get("dh", 96), meta.get("dw", 128))
+                    if frame_k:
+                        d = cv2.rotate(cv2.resize(d, (H, W) if frame_k in (1, 3) else (W, H)), ROTCV[frame_k])
                     d = cv2.resize(d, (W, H))
-                    if FLIP_IMAGE:
+                    if FLIP_IMAGE and "rot" not in meta and not frame_k:
                         d = cv2.rotate(d, cv2.ROTATE_180)
                     with S.lock:
                         S.phone_depth, S.phone_depth_t = d, time.time()
@@ -1313,6 +1360,14 @@ async def stream(ws: WebSocket):
     finally:
         PHONE["ws"] = None
         print("Phone disconnected")
+
+
+def set_frame_size(w, h):
+    """the processed frame is 640x480 landscape or 480x640 portrait; everything reads W, H from here."""
+    global W, H
+    if (w, h) != (W, H):
+        W, H = w, h
+        print(f"Frame size now {w}x{h}")
 
 
 def mjpeg(getter):
@@ -1405,6 +1460,9 @@ def apply_setting(key, value):
     elif key == "camera":
         send_phone({"type": "camera_mode", "zoom": value})   # the phone restarts ARKit: world coords reset
         MEM.clear()
+        DEPTH_SCALE.reset()
+        with S.lock:
+            S.planes = []
         if GRID is not None:
             GRID.reset()
         set_mode("IDLE")

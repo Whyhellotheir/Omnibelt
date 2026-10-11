@@ -203,6 +203,51 @@ Firmware safety limits:
 - **Holding the Orin:** two velcro straps through the tray notches, over the board's ends (port block and 40-pin header, not the fan).
 - **Holding the ESP32:** it's pressed into the breadboard; the breadboard's sticky back (plus double-sided tape or hot glue) holds it in the hub; the lid presses on. Zip-tie the USB cable to the hub so a tug can't pull the ESP32 out.
 - **Battery:** the cradle was sized for the INIU *Slim* (69 × 99 × 15 mm) and doesn't fit our bank. Skip the cradle and strap the bank straight to the belt with two velcro strips, one near each end. Keep its ports reachable. Avoid electrical tape. For a custom cradle, measure the bank (L × W × T mm) and change `BATT_SPAN` and the cradle dimensions in `parts.py`.
+## Nav accuracy upgrade (branch `nav-accuracy`, 2026-10-11)
+
+**What changed, and why**
+
+| Field problem | Fix | Where |
+|---|---|---|
+| Wallet read as "phone"; items missed | One fixed YOLO-World vocabulary (keys, wallet, water bottle + memory items + look-alikes), run in its own detector thread. A target under a more confident look-alike is dropped. A new spot needs 3 of the last 5 looks to agree, in world space so it holds while walking. | `vision/orin/finder.py` |
+| Reach only fired when on top of the item | Depth is re-scaled every frame (ARKit feature points, else the known floor). Item distance comes from the item's near surface, or an ARKit tabletop hit. Reach triggers at about 0.7 m (simulated: 0.67–0.72 m). The table-item floor guess no longer counts. | `vision/orin/geometry.py` |
+| Sideways image with the vertical holder | Orientation auto-detected from the ARKit pose. The phone rotates (and sends `rot`); otherwise the Orin rotates the image, lens values, hands, tracked points and pose. The frame becomes 480×640. | `geometry.py`, `BeltStreamer.swift` |
+| Low fps | Depth and YOLO-World each run in their own thread. Depth uses a TensorRT engine when built. Per-stage timing is shown on the dashboard and printed every 75 frames. | `vision/orin/depth_trt.py` |
+| Memory overwritten by one bad sighting | Per-item position tracks (weighted median), move detection, stale marking, spoken answers | `vision/orin/memory.py` |
+
+**New voice commands**
+- "Where did I leave my keys?" answers from memory ("Your keys are on the table behind you, to your right, about 2 meters away"), then asks "Want me to take you there?". Say "yes" or "no" with no wake word; the window is 8 s.
+- "This is my wallet" / "these are my keys" / "remember this as my bottle": hold the item in front of the camera. It saves 6 reference views (CLIP), so later finds prefer *your* item.
+- "Forget my wallet."
+
+**Judge dashboard** at `http://orin.local:8765/` (`vision/orin/dashboard.html`):
+- Live camera and depth, plus the floor map with route and purple memory pins.
+- Transcript of what it heard and said.
+- Memory cards with thumbnails, and the taught-item gallery.
+- Per-stage timing and the depth scale.
+- Settings: camera 1x/0.75x/0.5x (this resets tracking, map and memory, so set it **before** the demo), power 15W / MAXN SUPER, planner, and orientation.
+
+**Orin setup (once, on good Wi-Fi)**, run from `vision/orin/`:
+1. `pip install git+https://github.com/ultralytics/CLIP.git ftfy regex`
+2. `python3 finder.py export`: builds `yolow_vocab.engine`. Re-run if `VOCAB` changes; `FINDER_ENGINE=0` ignores the engine.
+3. Depth engines: follow `vision/tests/DEPTH_ENGINE.md` (export the ONNX, then `trtexec --fp16` for 252x336 and 336x252). Without the engines it falls back to HF fp16 in a thread.
+4. Power switching from the dashboard: run `sudo visudo -f /etc/sudoers.d/omnibelt` and add `<user> ALL=(root) NOPASSWD: /usr/sbin/nvpmodel`. Then `sudo chmod 440 /etc/sudoers.d/omnibelt`. Check the modes with `sudo nvpmodel -q`.
+5. Settings: `ORIENT=auto|portrait|landscape` (dashboard too), `CAM_HEIGHT_M` = the measured lens height.
+
+**iOS (Helena):** build from the branch and follow `software/ios/NavBeltApp/HANDOFF-nav-accuracy.md`. The Swift has **not been compiled yet**.
+
+**Interface additions**
+- Frame meta: `fp` (ARKit feature points `[u, v, z]`), `rot`, `W`, `H`.
+- New message `{"type":"planes"}` (horizontal ARKit planes).
+- Orin → phone `{"type":"camera_mode","zoom":...}`.
+- A `say` ending in "?" opens the phone's 8 s reply window.
+
+**Demo script (rehearse 5×)**
+1. Teach the keys, wallet and bottle.
+2. "Find my wallet": the belt walks you to the table, reach mode starts at arm's length, the ring guides your hand, "Got it."
+3. Move the keys while facing them, so memory sees the new spot.
+4. Turn to the judges and ask "Where did I leave my keys?". It answers, asks "Want me to take you there?", you say "yes", and it walks you back.
+
 ## Checkpoints
 1. Wave a hand at the phone and the right motor buzzes.
 2. Blindfolded hallway walk with no collisions: (a) on wall power, (b) on battery and Wi-Fi.
@@ -227,3 +272,4 @@ After checkpoint 3: freeze, rehearse the 90 s demo five times, and record a back
 - 2026-10-10: navbelt_code (2): floor map + A* path planning on the Orin, `tracking` flag from the phone, swap ring CAD. Fixed `parts.py` crashing at export (an ordering bug since the universal holder; all 24 STLs now export watertight). Fixed the obstacle height/distance math (the chest mount missed a 0.35 m backpack; synthetic checks in commit 3fcbcae).
 - 2026-10-10: Phone moves to the belt (front, navel). `CAM_HEIGHT_M` default changed 1.3 → 1.0; print the belt cradle, not the chest one.
 - 2026-10-10: Added the belt assembly plan from the claude.ai chat (order, % spacing, 16-piece wiring, fit fixes). The CAD-width check found the battery and Orin overlap under ~110 cm waist; rule: butt battery/Orin/hub together on the spine.
+- 2026-10-11: `nav-accuracy` branch. Six parallel module builds (geometry, depth engine, finder + teach, memory, dashboard + settings, iOS), wired into the server. Found and fixed a pixel-based confirmation bug that stopped target updates while walking; it now confirms in world space. Simulated table approach: reach fires at 0.67–0.72 m. Portrait frames are rotated through `/stream`; floor and backpack checks unchanged. iOS is not compiled yet (Helena).
